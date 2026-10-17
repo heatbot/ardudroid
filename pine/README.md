@@ -14,13 +14,14 @@ at most one armed order per direction.
 `0` await tap 3 → `1` await tap 4 → `2` await tap 5 → `3` tap 5 trailing →
 `4` armed (limit order) → `5` in trade → `6` done or cancelled.
 
-Cancel reasons: `close>2`, `stale`, `superseded`, `mid`, `expiry`, `bias`, `evict`.
+Cancel reasons: `close>2`, `runaway`, `superseded`, `mid`, `expiry`, `bias`, `evict`.
 Turn on **Debug mode** to see the reason next to each dead sequence and a stats table.
 
 ## Notes
 - The engine only changes state on confirmed bars, and pivots are drawn back on
   their pivot bar after confirmation, so drawings do not repaint.
-- Taps 3 and 5 slide right while they trail; tap 5 stops moving once it locks.
+- Taps 3 and 5 slide right while they trail. If price runs past a locked tap 5 before the fill, tap 5 re-trails and the target moves (entry and stop stay); the order is cancelled as `runaway` once tap 5 is more than `maxTap5Ext` zone heights past the 50% line.
+- Recommended setup: 1-minute chart with Bias timeframe = 5.
 - The `cancelled` alert fires only for armed sequences (the ones with a limit order).
 - Candidates that never reached tap 3 are deleted on cancel instead of faded,
   unless Debug mode is on.

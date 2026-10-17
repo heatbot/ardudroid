@@ -1,9 +1,9 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// 6-Tap v2 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
+// 6-Tap v2.1 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
 // Bearish model shown in comments; bullish is the exact mirror.
 //   Tap 1  external swing low (liquidity)      Tap 2  external swing high (protected)
 //   Zone   tap 1 .. tap 2, mid = 50%           Tap 3  big BOS / sweep of tap 1
-//   Tap 4  internal lower high below mid       Tap 5  mini BOS through tap 3, trails until locked
+//   Tap 4  internal lower high below mid       Tap 5  mini BOS through tap 3, trails until locked, re-trails if passed
 //   Tap 6  first touch of the entry level after the order is armed
 
 //@version=6
@@ -18,7 +18,7 @@ const string G_DSP  = "Display"
 const string G_DBG  = "Debug"
 
 string biasMode       = input.string("Auto", "Bias mode", options = ["Auto", "Bullish", "Bearish"], group = G_BIAS)
-string biasTF         = input.timeframe("", "Bias timeframe (empty = chart)", group = G_BIAS, tooltip = "Chart timeframe on 5m. Use 5 when charting 1m or lower.")
+string biasTF         = input.timeframe("", "Bias timeframe (empty = chart)", group = G_BIAS, tooltip = "Recommended: 1m chart with 5 here. On a 5m chart leave empty.")
 
 int    extLen         = input.int(5, "External pivot length", minval = 2, group = G_STR, tooltip = "Taps 1–3 and bias")
 int    intLen         = input.int(2, "Internal pivot length", minval = 1, group = G_STR, tooltip = "Taps 4–5 and tap 5 locking")
@@ -28,7 +28,9 @@ float  minZoneATR     = input.float(1.0, "Min zone size (× ATR 14)", minval = 0
 
 bool   require4InZone = input.bool(false, "Tap 4 must be inside the zone", group = G_RULE)
 string mitMode        = input.string("Off", "Invalidate if mid is hit before tap 5", options = ["Off", "Close", "Wick"], group = G_RULE)
-int    expiryBars     = input.int(150, "Expiry bars after arming", minval = 1, group = G_RULE)
+int    expiryBars     = input.int(40, "Expiry bars after arming", minval = 1, group = G_RULE)
+float  maxTap5Ext     = input.float(2.0, "Max tap 5 extension (× zone height from mid)", minval = 0.1, step = 0.1, group = G_RULE)
+int    minArmBars     = input.int(1, "Bars armed before trade lines show", minval = 0, group = G_RULE)
 int    maxActive      = input.int(10, "Max active sequences", minval = 1, group = G_RULE)
 int    dedupeOverlap  = input.int(50, "Dedupe overlap (%)", minval = 0, maxval = 100, group = G_RULE)
 
@@ -196,6 +198,28 @@ f_levels(Seq s) =>
     s.tgtP   := t
     s
 
+// Target only (entry and stop stay fixed once armed).
+f_target(Seq s) =>
+    s.tgtP := targetMode == "Tap 5" ? s.p5 : targetMode == "Tap 5 + ext" ? s.p5 + s.dir * targetExtTicks * syminfo.mintick : s.tgtP
+    s
+
+// Tap 5 follows a new extreme; returns true if it moved.
+f_trail5(Seq s) =>
+    float ex = f_trendExt(s.dir)
+    bool  mv = f_beyond(s.dir, ex, s.p5)
+    if mv
+        s.p5 := ex
+        s.b5 := bar_index
+        label.set_x(s.l5, s.b5)
+        line.set_xy1(s.h5, s.b5, s.p5)
+        line.set_xy2(s.h5, s.b5 + BRACKET, s.p5)
+        line.set_y2(s.v5, s.p5)
+        dirty.set(0, true)
+    mv
+
+// Tap 5 ran more than maxTap5Ext zone heights beyond mid.
+f_runaway(Seq s) => math.abs(s.mid - s.p5) > maxTap5Ext * math.abs(s.p2 - s.p1)
+
 f_alert(string ev, Seq s, string reason) =>
     string msg = '{"event":"' + ev + '","dir":"' + (s.dir == 1 ? "long" : "short") + '","entry":' + f_num(s.entryP) + ',"stop":' + f_num(s.stopP) + ',"target":' + f_num(s.tgtP) + (reason != "" ? ',"reason":"' + reason + '"' : "") + ',"symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '"}'
     alert(msg, alert.freq_once_per_bar_close)
@@ -361,7 +385,6 @@ f_arm(Seq s) =>
     s.state    := 4
     s.armedBar := bar_index
     f_levels(s)
-    f_drawTrade(s, bar_index + BRACKET)
     for o in active
         if o.id != s.id and o.dir == s.dir and o.state == 4
             f_cancel(o, "superseded")
@@ -520,9 +543,6 @@ if barstate.isconfirmed
                 f_cancel(s, "bias")
             else if s.state == 4 and bar_index - s.armedBar > expiryBars
                 f_cancel(s, "expiry")
-            else if s.state == 4 and bar_index > s.armedBar and f_beyond(d, f_trendExt(d), s.p5)
-                // Target spent before the fill.
-                f_cancel(s, "stale")
             else if s.state == 4 and bar_index > s.armedBar and f_reach(d, s.entryP)
                 f_fill(s)
             else if d == -1 ? close > s.p2 : close < s.p2
@@ -578,25 +598,25 @@ if barstate.isconfirmed
                     s.h5 := f_hline(s.b5, s.p5, d)
                     s.v5 := line.new(bar_index, s.p3, bar_index, s.p5, xloc = xloc.bar_index, color = c, width = 1)
             else if s.state == 3
-                // Tap 5 trails the extreme ...
-                float ex = f_trendExt(d)
-                if f_beyond(d, ex, s.p5)
-                    s.p5 := ex
-                    s.b5 := bar_index
-                    label.set_x(s.l5, s.b5)
-                    line.set_xy1(s.h5, s.b5, s.p5)
-                    line.set_xy2(s.h5, s.b5 + BRACKET, s.p5)
-                    line.set_y2(s.v5, s.p5)
-                    dirty.set(0, true)
-                // ... and locks on an opposite internal pivot after it, or a touch of the entry.
+                // Tap 5 trails the extreme and locks on an opposite internal pivot after it, or a touch of the entry.
+                f_trail5(s)
                 float opp = d == -1 ? iPH : iPL
-                if (not na(opp) and iPB > s.b5) or f_reach(d, f_entry(s))
+                if f_runaway(s)
+                    f_cancel(s, "runaway")
+                else if (not na(opp) and iPB > s.b5) or f_reach(d, f_entry(s))
                     f_arm(s)
+            else if s.state == 4
+                // Price ran past the locked tap 5: re-trail it and move the target; entry and stop stay.
+                if f_trail5(s)
+                    if f_runaway(s)
+                        f_cancel(s, "runaway")
+                    else
+                        f_target(s)
 
             if s.state <= 4
                 box.set_right(s.zone, bar_index)
                 line.set_x2(s.midLn, bar_index)
-                if s.state == 4
+                if s.state == 4 and bar_index - s.armedBar >= minArmBars
                     f_drawTrade(s, bar_index + BRACKET)
 
     // Trade outcome after a fill. Both on one bar -> stop.
@@ -685,7 +705,7 @@ if debugMode and barstate.islast
     f_row(dbg, 2, "Filled", str.tostring(nFill))
     f_row(dbg, 3, "  Open", str.tostring(nFill - nRes))
     f_row(dbg, 4, "Cancelled", str.tostring(nz(cnt.get("cancelled"))))
-    array<string> reasons = array.from("evict", "bias", "mid", "close>2", "stale", "superseded", "expiry")
+    array<string> reasons = array.from("evict", "bias", "mid", "close>2", "runaway", "superseded", "expiry")
     for [r, rs] in reasons
         f_row(dbg, 5 + r, "  " + rs, str.tostring(nz(cnt.get(rs))))
     f_row(dbg, 12, "Target hits", str.tostring(nTgt))
