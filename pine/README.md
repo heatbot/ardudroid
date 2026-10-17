@@ -2,8 +2,8 @@
 
 | File | What it is |
 |---|---|
-| `6-tap.pine` | Indicator (v2.6): live charting, alerts, shadow research, trade log |
-| `6-tap-strategy.pine` | Strategy (v3.0): same engine with real orders, for Deep Backtesting. **Generated** — do not edit |
+| `6-tap.pine` | Indicator (v2.8): live charting, alerts, shadow research, trade log |
+| `6-tap-strategy.pine` | Strategy (v3.2): same engine with real orders, for Deep Backtesting. **Generated** — do not edit |
 | `strategy/head.pine`, `strategy/tail.pine` | Strategy-only parts (header + inputs, orders + R table) |
 | `build_strategy.py` | Builds the strategy from the indicator's shared inputs and engine blocks |
 
@@ -73,12 +73,44 @@ already taken moves to the next free one. Text size defaults to tiny.
   E/F tap 5 with breakeven at 1R / 1.5R MFE, G half off at 1R then breakeven and
   tap 5. Plus the daily-limit comparison and MFE / MAE excursion shares.
 
+## Entry modes (v3.1)
+`entryMode` picks what drives the chart, the alerts and the strategy's orders:
+
+- **50% limit** / **Tap 4 sweep**: a limit order rests at the 50% line (or 1 tick beyond
+  tap 4) from arming; stop beyond tap 2.
+- **Confirmation** (default): after arming, wait for price to trade through tap 4 and reach
+  `sweepLevel` (zone edge = tap 1, 50%, or tap 4 only). Tap 6 is the sweep peak (it follows new
+  extremes). The confirmation level (CL) is the latest `confLen` fractal confirmed since the
+  sweep started and before the peak bar, else the extreme between sweep start and peak. Enter
+  on a close beyond CL (`confBreak = Close`; the strategy sends a market order filled at the
+  next open) or with a stop order 1 tick beyond it. Stop = peak ± `stopBufferATR` × ATR.
+  Cancelled by `close>2`, `noconf` (no confirmation within `confExpiryBars` of the sweep) or
+  `tinyR` (risk under `minRiskTicks`).
+
+Every armed sequence runs all three modes in parallel; the **Entry variants** debug table
+compares them (fills and fill rate, win rate, avg win, expectancy, ex top 5, PF, max drawdown,
+average risk, net $, and each mode's best exit variant).
+
+## Stop management and liquidity lines (v3.2)
+`trailMode` trails the chart trade's stop: after price breaks the last post-entry micro pivot
+in the trade direction (and is `trailStartR` in favor), the stop moves beyond the
+**second-latest** post-entry micro pivot on the stop side (`One behind`, default) or the
+latest (`Latest`), plus `trailBufferATR` × ATR. It only moves in favor; the old level is left
+as a faded segment. Exit variants J (3R + one behind), K (3R + latest) and L (tap 5 + one
+behind) test this in parallel.
+
+Liquidity lines extend from taps 2, 4 and 5 until price trades through them or the sequence
+ends; a gray dashed line marks the confirmation level up to the entry bar
+(`showLiquidityLines`).
+
 ## Trade log (v2.6)
 Turn on **Trade log** (Debug group) and open the Pine Logs pane. The header prints on the
 first bar; each filled trade (chart and shadow) prints one CSV line once all exit
-variants A–I have resolved:
+variants have resolved:
 
-`id,dir,spawn_time,arm_time,fill_time,exit_time,entry,stop,target,risk_pts,planned_rr,zone_h_atr,tap5_ext_zones,bars_arm_fill,session,tags,result_A,…,result_I,mfe_r,mae_r`
+`id,entry_mode,dir,spawn_time,arm_time,fill_time,exit_time,entry,stop,target,risk_pts,planned_rr,zone_h_atr,tap5_ext_zones,bars_arm_fill,session,tags,sweep_peak,conf_level,result_A,…,result_L,mfe_r,mae_r`
+
+One line per entry mode per filled trade (v3.1).
 
 Times are ET (`yyyy-MM-dd HH:mm`). `tags` lists shadow filters that tagged the trade
 (`|`-separated), plus `rr` / `limit` for optional trades. Exit variants H and I are fixed
@@ -86,8 +118,10 @@ Times are ET (`yyyy-MM-dd HH:mm`). `tags` lists shadow filters that tagged the t
 
 ## Strategy (v3.0)
 All filters are enforced (no shadow mode). One order per armed sequence, id `6T<seq id>`:
-a limit entry at the entry level and an exit for the chosen variant (A–I; G uses two
-50% exits and needs 2+ contracts). Limit fills need price to trade 1 tick through
+the entry follows `entryMode` (a resting limit; on a confirmation close a market order at the
+next open; or a stop order 1 tick beyond the confirmation level while the sweep runs) and an
+exit for the chosen variant (A–L; J/K/L trail the stop with the Stop management inputs;
+G uses two 50% exits and needs 2+ contracts). Limit fills need price to trade 1 tick through
 (`backtest_fill_limits_assumption = 1`); a touch the indicator counts as a fill but the
 strategy does not is reported as a **missed fill**. Orders are only working in the chosen
 sessions. `maxConcurrent` (1–3) caps open + pending positions; with `allowOpposite` off,
