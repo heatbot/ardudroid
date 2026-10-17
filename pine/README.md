@@ -15,6 +15,7 @@ at most one armed order per direction.
 `4` armed (limit order) → `5` in trade → `6` done or cancelled.
 
 Cancel reasons: `close>2`, `runaway`, `superseded`, `mid`, `expiry`, `bias`, `evict`.
+`bias` only applies when "Cancel sequences when bias flips" is on (off by default); bias otherwise just filters which direction new sequences spawn in, using its own longer pivot length (15).
 Turn on **Debug mode** to see the reason next to each dead sequence and a stats table.
 
 ## Notes

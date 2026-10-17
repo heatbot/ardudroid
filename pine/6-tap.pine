@@ -1,5 +1,5 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// 6-Tap v2.1 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
+// 6-Tap v2.2 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
 // Bearish model shown in comments; bullish is the exact mirror.
 //   Tap 1  external swing low (liquidity)      Tap 2  external swing high (protected)
 //   Zone   tap 1 .. tap 2, mid = 50%           Tap 3  big BOS / sweep of tap 1
@@ -19,6 +19,8 @@ const string G_DBG  = "Debug"
 
 string biasMode       = input.string("Auto", "Bias mode", options = ["Auto", "Bullish", "Bearish"], group = G_BIAS)
 string biasTF         = input.timeframe("", "Bias timeframe (empty = chart)", group = G_BIAS, tooltip = "Recommended: 1m chart with 5 here. On a 5m chart leave empty.")
+int    biasLen        = input.int(15, "Bias pivot length", minval = 2, group = G_BIAS, tooltip = "Swings used for bias only, kept longer than the external pivot length so a zone's own leg does not flip bias")
+bool   biasCancel     = input.bool(false, "Cancel sequences when bias flips", group = G_BIAS, tooltip = "Off: bias only filters new sequences; a close beyond tap 2 invalidates")
 
 int    extLen         = input.int(5, "External pivot length", minval = 2, group = G_STR, tooltip = "Taps 1–3 and bias")
 int    intLen         = input.int(2, "Internal pivot length", minval = 1, group = G_STR, tooltip = "Taps 4–5 and tap 5 locking")
@@ -29,7 +31,7 @@ float  minZoneATR     = input.float(1.0, "Min zone size (× ATR 14)", minval = 0
 bool   require4InZone = input.bool(false, "Tap 4 must be inside the zone", group = G_RULE)
 string mitMode        = input.string("Off", "Invalidate if mid is hit before tap 5", options = ["Off", "Close", "Wick"], group = G_RULE)
 int    expiryBars     = input.int(40, "Expiry bars after arming", minval = 1, group = G_RULE)
-float  maxTap5Ext     = input.float(2.0, "Max tap 5 extension (× zone height from mid)", minval = 0.1, step = 0.1, group = G_RULE)
+float  maxTap5Ext     = input.float(3.0, "Max tap 5 extension (× zone height from mid)", minval = 0.1, step = 0.1, group = G_RULE)
 int    minArmBars     = input.int(1, "Bars armed before trade lines show", minval = 0, group = G_RULE)
 int    maxActive      = input.int(10, "Max active sequences", minval = 1, group = G_RULE)
 int    dedupeOverlap  = input.int(50, "Dedupe overlap (%)", minval = 0, maxval = 100, group = G_RULE)
@@ -80,6 +82,7 @@ type Seq
     int    brk3             // bar that broke tap 1
     int    brk5             // bar that broke tap 3
     int    armedBar         // bar where tap 5 locked
+    int    spawnBar         // bar the sequence was created
     string result = ""      // "", "target", "stop" or a cancel reason
     bool   faded = false
     label  l1
@@ -132,7 +135,7 @@ int   ePB = bar_index - extLen
 int   iPB = bar_index - intLen
 float atr = ta.atr(14)
 
-int autoBias = nz(request.security(syminfo.tickerid, biasTF, f_bias(extLen), lookahead = barmerge.lookahead_off))
+int autoBias = nz(request.security(syminfo.tickerid, biasTF, f_bias(biasLen), lookahead = barmerge.lookahead_off))
 int bias     = biasMode == "Auto" ? autoBias : biasMode == "Bullish" ? 1 : -1
 
 // ───────────────────────── State ─────────────────────────
@@ -472,7 +475,8 @@ f_spawn(int d, int b1, float p1, int b2, float p2) =>
             Seq ev = active.remove(ix)
             f_cancel(ev, "evict")
         color c = seqColor(d)
-        s.id    := nz(cnt.get("spawned")) + 1
+        s.id       := nz(cnt.get("spawned")) + 1
+        s.spawnBar := bar_index
         f_inc("spawned")
         s.l1    := f_label(b1, "1", d, true)
         s.l2    := f_label(b2, "2", d, false)
@@ -539,7 +543,7 @@ if barstate.isconfirmed
             float piv = d == -1 ? iPH : iPL
             bool  ok4 = not na(piv) and (d == -1 ? piv < s.mid : piv > s.mid) and (not require4InZone or (d == -1 ? piv > s.p1 : piv < s.p1))
 
-            if biasMode == "Auto" and bias != d
+            if biasCancel and biasMode == "Auto" and bias != d and bar_index > s.spawnBar
                 f_cancel(s, "bias")
             else if s.state == 4 and bar_index - s.armedBar > expiryBars
                 f_cancel(s, "expiry")
