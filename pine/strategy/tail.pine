@@ -1,0 +1,191 @@
+
+// ───────────────────────── Orders ─────────────────────────
+// The engine above decides when a sequence arms, re-trails or is cancelled; the broker
+// emulator decides the fill (1 tick through the limit) and the exit.
+string VKEY = str.substring(exitVariant, 0, 1)
+int    VAR  = str.pos("ABCDEFGHI", VKEY)                         // 0 = A … 8 = I
+var array<float> VAR_R = array.from(0.0, 1.5, 2.0, 3.0, 0.0, 0.0, 0.0, 4.0, 5.0)   // fixed-R targets (0 = tap 5)
+
+var array<Seq>        ordered = array.new<Seq>()          // sequences with a live order or an open position
+var map<string, float> riskUsd = map.new<string, float>()  // planned risk in $ per entry id
+var map<string, float> pnlAcc  = map.new<string, float>()  // closed P&L per entry id (partials add up)
+var array<string>     closing = array.new<string>()       // entry ids with closed fills, waiting to finalize
+var array<float>      stR     = array.new<float>()        // R per finished trade, in exit order
+var map<int, float>   monthNet = map.new<int, float>()    // net $ per exit month
+var array<int>        sday    = array.new_int(2, 0)       // [trading day, losing trades today]
+var int nClosedSeen = 0
+var int nSkipped    = 0
+var int nMissed     = 0
+
+f_sid(Seq s) => "6T" + str.tostring(s.id)
+
+f_sessOK() =>
+    int ss = f_session()
+    sessionMode == "All" ? true : sessionMode == "Skip NY" ? ss != 0 : sessionMode == "London only" ? ss == 1 : ss != 0
+
+// Contracts still open for an entry id.
+f_openQty(string id) =>
+    float q = 0.0
+    if strategy.opentrades > 0
+        for i = 0 to strategy.opentrades - 1
+            if strategy.opentrades.entry_id(i) == id
+                q += math.abs(strategy.opentrades.size(i))
+    q
+
+// Entry id among the most recent closed trades (a fill and exit on the same bar is never seen open).
+f_closedHas(string id) =>
+    bool hit = false
+    int  n   = strategy.closedtrades
+    if n > 0
+        for i = n - 1 to math.max(0, n - 10)
+            if strategy.closedtrades.entry_id(i) == id
+                hit := true
+                break
+    hit
+
+// Exit orders for the chosen variant. G: half at 1R, the rest to tap 5 with the stop at breakeven after the partial.
+f_exits(Seq s, float stop, bool partialDone) =>
+    string id   = f_sid(s)
+    float  risk = math.abs(s.entryP - s.stopP)
+    if VAR == 6
+        if not partialDone
+            strategy.exit(id + "a", from_entry = id, qty_percent = 50, stop = stop, limit = s.entryP + s.dir * risk)
+        strategy.exit(id + "b", from_entry = id, stop = partialDone ? s.entryP : stop, limit = s.tgtP)
+    else
+        float tgt = VAR_R.get(VAR) > 0 ? s.entryP + s.dir * VAR_R.get(VAR) * risk : s.tgtP
+        strategy.exit(id + "x", from_entry = id, stop = stop, limit = tgt)
+    s
+
+f_cancelAll(Seq s) =>
+    string id = f_sid(s)
+    strategy.cancel(id)
+    strategy.cancel(id + "x")
+    strategy.cancel(id + "a")
+    strategy.cancel(id + "b")
+    s
+
+if barstate.isconfirmed
+    int tdayS = f_tday()
+    if tdayS != sday.get(0)
+        sday.set(0, tdayS)
+        sday.set(1, 0)
+
+    // 1) Newly armed sequences: place an order if every enforced rule allows it.
+    for s in active
+        if s.state == 4 and s.armedBar == bar_index and not s.hidden and not s.sOrdered
+            bool ok = time >= startDate and time <= endDate and not s.opt and ordered.size() < maxConcurrent
+            ok := ok and (dailyMaxLosses == 0 or sday.get(1) < dailyMaxLosses)
+            if ok and not allowOpposite
+                for o in ordered
+                    if o.dir != s.dir and o.sFilled
+                        ok := false
+            if ok
+                s.sOrdered := true
+                riskUsd.put(f_sid(s), math.abs(s.entryP - s.stopP) * syminfo.pointvalue * contracts)
+                ordered.push(s)
+            else
+                nSkipped += 1
+
+    // 2) Keep orders in step with the engine; manage open positions.
+    for s in ordered
+        string id = f_sid(s)
+        float  q  = f_openQty(id)
+        if not s.sFilled and (q > 0 or f_closedHas(id))
+            s.sFilled  := true
+            s.sFillBar := bar_index
+            if not allowOpposite
+                for o in ordered
+                    if o.dir != s.dir and not o.sFilled and not o.sDone
+                        f_cancelAll(o)
+                        riskUsd.remove(f_sid(o))
+                        o.sDone := true
+        if not s.sDone
+            if s.sFilled
+                if q > 0
+                    if bar_index > s.sFillBar
+                        s.sMfe := math.max(s.sMfe, (s.dir == -1 ? s.entryP - low : high - s.entryP) / math.abs(s.entryP - s.stopP))
+                    bool be = (VAR == 4 and s.sMfe >= 1.0) or (VAR == 5 and s.sMfe >= 1.5)
+                    f_exits(s, be ? s.entryP : s.stopP, VAR == 6 and q < contracts)
+                else
+                    s.sDone := true
+            else if s.state == 4
+                // Pending: working only in the allowed sessions; the target follows tap 5 re-trails.
+                if f_sessOK()
+                    strategy.entry(id, s.dir == 1 ? strategy.long : strategy.short, qty = contracts, limit = s.entryP)
+                    f_exits(s, s.stopP, false)
+                else
+                    f_cancelAll(s)
+            else
+                // The engine filled (touch only: missed under the 1-tick-through rule) or cancelled it.
+                if s.state == 5 or s.result == "target" or s.result == "stop"
+                    nMissed += 1
+                f_cancelAll(s)
+                riskUsd.remove(id)
+                s.sDone := true
+    if ordered.size() > 0
+        for j = ordered.size() - 1 to 0
+            if ordered.get(j).sDone
+                ordered.remove(j)
+
+    // 3) Closed trades -> R per entry (partial exits of one entry add up).
+    if strategy.closedtrades > nClosedSeen
+        for i = nClosedSeen to strategy.closedtrades - 1
+            string eid = strategy.closedtrades.entry_id(i)
+            pnlAcc.put(eid, nz(pnlAcc.get(eid)) + strategy.closedtrades.profit(i))
+            if not closing.includes(eid)
+                closing.push(eid)
+        nClosedSeen := strategy.closedtrades
+    if closing.size() > 0
+        for j = closing.size() - 1 to 0
+            string eid = closing.get(j)
+            if f_openQty(eid) == 0
+                float ru  = riskUsd.get(eid)
+                float pnl = nz(pnlAcc.get(eid))
+                if not na(ru) and ru > 0
+                    float r = pnl / ru
+                    stR.push(r)
+                    if r < 0
+                        sday.set(1, sday.get(1) + 1)
+                    int mk = year(time, "America/New_York") * 100 + month(time, "America/New_York")
+                    monthNet.put(mk, nz(monthNet.get(mk)) + pnl)
+                closing.remove(j)
+                pnlAcc.remove(eid)
+                riskUsd.remove(eid)
+
+// ───────────────────────── R table ─────────────────────────
+var table rT = na
+if barstate.islast
+    if na(rT)
+        rT := table.new(f_pos(rTablePos), 2, 24, bgcolor = #131722, frame_width = 0, border_width = 0)
+    [n, wr, ex, md, ex5] = f_robust(stR)
+    float gw  = 0.0
+    float gl  = 0.0
+    int   nW  = 0
+    float cum = 0.0
+    float pk  = 0.0
+    float dd  = 0.0
+    int   stk = 0
+    int   mxs = 0
+    for r in stR
+        if r > 0
+            gw += r
+            nW += 1
+        else
+            gl -= r
+        cum += r
+        pk  := math.max(pk, cum)
+        dd  := math.max(dd, pk - cum)
+        stk := r < 0 ? stk + 1 : 0
+        mxs := math.max(mxs, stk)
+    float pf  = gl > 0 ? gw / gl : na
+    float net = strategy.netprofit
+    float bestMonth = 0.0
+    for [k, v] in monthNet
+        bestMonth := math.max(bestMonth, v)
+    float mShare = net > 0 ? bestMonth / net : na
+    bool  pass   = n >= 150 and not na(ex) and ex >= 0.15 and not na(pf) and pf >= 1.3 and not na(mShare) and mShare <= 0.30
+    array<string> K = array.from("Engine", "Exit variant", "Trades", "Win rate", "Avg win", "Avg loss", "Expectancy", "Exp ex top 5 wins", "Median R", "Profit factor (R)", "Max drawdown", "Max consecutive losses", "Net $ (Strategy Tester)", "Best month share of net", "Missed fills (touch, no fill)", "Arms skipped (rules / cap)", "Pass bar (≥150, ≥+0.15R, PF≥1.3, month≤30%)")
+    array<string> V = array.from(ENGINE_VERSION, exitVariant, str.tostring(n), f_pct(wr), f_r(nW > 0 ? gw / nW : na), f_r(n - nW > 0 ? -gl / (n - nW) : na), f_r(ex), f_r(ex5), f_r(md), f_ratio(pf), f_r(-dd), str.tostring(mxs), str.tostring(net, "#,##0.00"), f_pct(mShare), str.tostring(nMissed), str.tostring(nSkipped), pass ? "PASS" : "not yet")
+    for [i, k] in K
+        table.cell(rT, 0, i, k, text_color = #B2B5BE, text_size = tblSize, text_halign = text.align_left)
+        table.cell(rT, 1, i, V.get(i), text_color = #B2B5BE, text_size = tblSize, text_halign = text.align_right)

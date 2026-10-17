@@ -1,4 +1,17 @@
-# 6-Tap indicator (Pine Script v6)
+# 6-Tap indicator and strategy (Pine Script v6)
+
+| File | What it is |
+|---|---|
+| `6-tap.pine` | Indicator (v2.6): live charting, alerts, shadow research, trade log |
+| `6-tap-strategy.pine` | Strategy (v3.0): same engine with real orders, for Deep Backtesting. **Generated** — do not edit |
+| `strategy/head.pine`, `strategy/tail.pine` | Strategy-only parts (header + inputs, orders + R table) |
+| `build_strategy.py` | Builds the strategy from the indicator's shared inputs and engine blocks |
+
+The engine (types, detection, state machine) lives between `// ==== ENGINE BEGIN ====` and
+`// ==== ENGINE END ====` in `6-tap.pine`. Both scripts carry the same `ENGINE_VERSION`.
+After changing the indicator or `strategy/*.pine`, run `python3 pine/build_strategy.py`.
+A Pine library was not used: it would have to be published on TradingView before either
+script could import it.
 
 `6-tap.pine` is a TradingView overlay that detects and marks the 6-tap sequence
 (taps 1–6, the supply/demand zone and its 50% line), colored by direction, with
@@ -59,6 +72,33 @@ already taken moves to the next free one. Text size defaults to tiny.
 - **Exit variants** (chart trades): A tap 5 (the chart), B 1.5R, C 2R, D 3R,
   E/F tap 5 with breakeven at 1R / 1.5R MFE, G half off at 1R then breakeven and
   tap 5. Plus the daily-limit comparison and MFE / MAE excursion shares.
+
+## Trade log (v2.6)
+Turn on **Trade log** (Debug group) and open the Pine Logs pane. The header prints on the
+first bar; each filled trade (chart and shadow) prints one CSV line once all exit
+variants A–I have resolved:
+
+`id,dir,spawn_time,arm_time,fill_time,exit_time,entry,stop,target,risk_pts,planned_rr,zone_h_atr,tap5_ext_zones,bars_arm_fill,session,tags,result_A,…,result_I,mfe_r,mae_r`
+
+Times are ET (`yyyy-MM-dd HH:mm`). `tags` lists shadow filters that tagged the trade
+(`|`-separated), plus `rr` / `limit` for optional trades. Exit variants H and I are fixed
+4R and 5R.
+
+## Strategy (v3.0)
+All filters are enforced (no shadow mode). One order per armed sequence, id `6T<seq id>`:
+a limit entry at the entry level and an exit for the chosen variant (A–I; G uses two
+50% exits and needs 2+ contracts). Limit fills need price to trade 1 tick through
+(`backtest_fill_limits_assumption = 1`); a touch the indicator counts as a fill but the
+strategy does not is reported as a **missed fill**. Orders are only working in the chosen
+sessions. `maxConcurrent` (1–3) caps open + pending positions; with `allowOpposite` off,
+opposite-direction arms place no order while a position is open, and pending opposite
+orders are pulled when one fills. The R table reports trades, win rate, avg win/loss,
+expectancy, expectancy ex top 5, median R, profit factor, max drawdown, max loss streak,
+best month's share of net profit, missed fills, and the pass bar
+(≥150 trades, ≥ +0.15R, PF ≥ 1.3, no month > 30% of net).
+
+Higher-timeframe bias in both scripts uses the last closed HTF bar
+(`expr[1]` with `lookahead_on`), so it does not repaint.
 
 ## Notes
 - The engine only changes state on confirmed bars, and pivots are drawn back on

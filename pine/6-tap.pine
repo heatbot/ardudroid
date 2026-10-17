@@ -1,5 +1,5 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// 6-Tap v2.5 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
+// 6-Tap v2.6 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
 // Bearish model shown in comments; bullish is the exact mirror.
 //   Tap 1  external swing low (liquidity)      Tap 2  external swing high (protected)
 //   Zone   tap 1 .. tap 2, mid = 50%           Tap 3  big BOS / sweep of tap 1
@@ -10,6 +10,7 @@
 indicator("6-Tap", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 200)
 
 // ───────────────────────── Inputs ─────────────────────────
+// ==== SHARED INPUTS BEGIN ====  (copied into "6-Tap Strategy" by pine/build_strategy.py)
 const string G_BIAS = "Bias"
 const string G_STR  = "Structure"
 const string G_RULE = "Rules"
@@ -32,7 +33,6 @@ float  minZoneATR     = input.float(1.0, "Min zone size (× ATR 14)", minval = 0
 
 bool   require4InZone = input.bool(false, "Tap 4 must be inside the zone", group = G_RULE)
 string mitMode        = input.string("Off", "Invalidate if mid is hit before tap 5", options = ["Off", "Close", "Wick"], group = G_RULE)
-int    expiryBars     = input.int(40, "Expiry bars after arming", minval = 1, group = G_RULE)
 float  maxTap5Ext     = input.float(3.0, "Max tap 5 extension (× zone height from mid)", minval = 0.1, step = 0.1, group = G_RULE)
 int    minArmBars     = input.int(1, "Bars armed before trade lines show", minval = 0, group = G_RULE)
 int    maxActive      = input.int(10, "Max active sequences", minval = 1, group = G_RULE)
@@ -44,12 +44,22 @@ string targetMode     = input.string("Tap 5", "Target mode", options = ["Tap 5",
 int    targetExtTicks = input.int(0, "Target extension (ticks)", minval = 0, group = G_TRD)
 float  fixedR         = input.float(2.0, "Fixed R", minval = 0.1, step = 0.1, group = G_TRD)
 float  stopBufferATR  = input.float(0.1, "Stop buffer (× ATR 14)", minval = 0, step = 0.05, group = G_TRD)
+
+bool   showTradeLevels = input.bool(true, "Show trade levels", group = G_DSP)
+int    keepHistory     = input.int(5, "Finished / cancelled sequences to keep", minval = 0, group = G_DSP)
+bool   keepCancelled   = input.bool(true, "Keep cancelled sequences (faded)", group = G_DSP)
+color  bullColor       = input.color(#26A69A, "Bullish color", group = G_DSP)
+color  bearColor       = input.color(#E5534B, "Bearish color", group = G_DSP)
+string labelSize       = input.string("small", "Label size", options = ["tiny", "small", "normal", "large"], group = G_DSP)
+// ==== SHARED INPUTS END ====
+
 float  minRR          = input.float(1.5, "Min planned R:R (below = optional)", minval = 0, step = 0.1, group = G_TRD)
 float  maxRR          = input.float(0.0, "Max planned R:R (above = optional, 0 = off)", minval = 0, step = 0.5, group = G_TRD)
 
 const string FLT_TIP = "Off: rule not applied. Shadow: never cancels; tags the sequence, hides it from the chart and keeps resolving it in the background for the impact table. Enforce: cancels."
 string runMode     = input.string("Off", "runaway (max tap 5 extension)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
 string expMode     = input.string("Off", "expiry (bars after arming)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
+int    expiryBars  = input.int(40, "Expiry bars after arming", minval = 1, group = G_FLT)
 string supMode     = input.string("Off", "superseded (one armed order per direction)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
 string zoneMode    = input.string("Shadow", "minZoneATR (min zone size)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
 string maxZoneMode = input.string("Shadow", "maxZoneATR (max zone size)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
@@ -61,44 +71,22 @@ string sessMode    = input.string("Shadow", "session (skip fills NY 09:30–16:0
 string dailyMode      = input.string("Shadow", "Daily loss limit", options = ["Off", "Shadow", "Enforce"], group = G_DAY, tooltip = "Day starts 18:00 ET; only non-optional trades count. Shadow: no limit vs 2 / 3 losses in the exits table. Enforce: after the limit, new setups that day are drawn as optional (limit).")
 int    dailyMaxLosses = input.int(3, "Max losses per day", minval = 1, group = G_DAY)
 
-bool   showTradeLevels = input.bool(true, "Show trade levels", group = G_DSP)
-int    keepHistory     = input.int(5, "Finished / cancelled sequences to keep", minval = 0, group = G_DSP)
-bool   keepCancelled   = input.bool(true, "Keep cancelled sequences (faded)", group = G_DSP)
-color  bullColor       = input.color(#26A69A, "Bullish color", group = G_DSP)
-color  bearColor       = input.color(#E5534B, "Bearish color", group = G_DSP)
-string labelSize       = input.string("small", "Label size", options = ["tiny", "small", "normal", "large"], group = G_DSP)
 
 bool   debugMode       = input.bool(false, "Debug mode (kill reasons + stats table)", group = G_DBG)
 float  commissionPerSide = input.float(0.62, "Commission per side ($ per contract)", minval = 0, step = 0.01, group = G_DBG)
 int    contracts       = input.int(1, "Contracts", minval = 1, group = G_DBG)
 bool   debugBreakdown  = input.bool(true, "Filter impact table", group = G_DBG)
 bool   debugExits      = input.bool(true, "Exit variants table", group = G_DBG)
+bool   debugLog        = input.bool(false, "Trade log (CSV in Pine Logs)", group = G_DBG, tooltip = "One CSV line per filled trade when all exit variants have resolved; times in ET")
 string statsTablePos   = input.string("top_right", "Stats table position", options = ["top_left", "top_right", "bottom_left", "bottom_right"], group = G_DBG)
 string impactTablePos  = input.string("bottom_left", "Impact table position", options = ["top_left", "top_right", "bottom_left", "bottom_right"], group = G_DBG)
 string exitsTablePos   = input.string("top_left", "Exits table position", options = ["top_left", "top_right", "bottom_left", "bottom_right"], group = G_DBG)
 string tableTextSize   = input.string("tiny", "Table text size", options = ["tiny", "small", "normal"], group = G_DBG)
 
-const int BRACKET = 8    // bars a tap bracket extends to the right
-const int ZONE_TR = 88   // zone fill transparency
-const int FADE_ZT = 95   // faded zone fill transparency
-const int FADE_TR = 60   // faded labels / lines transparency
-const int MID_TR  = 30   // 50% line transparency
-const int SHADOW_CAP = 5 // hidden sequences kept: SHADOW_CAP × maxActive
-const int MAX_BACK   = 9000  // drawings can't be placed ~10,000+ bars back with xloc.bar_index
-const int EXIT_CAP   = 300   // trades whose exit variants are still being resolved
-const int NV         = 7     // exit variants A–G
+const bool DRAW = true   // the strategy turns drawings off for faster deep backtests
 
-// Shadow filter indices; "rr" (index NF) is the R:R optional flag, reported like a filter.
-const int F_RUN    = 0
-const int F_EXP    = 1
-const int F_SUP    = 2
-const int F_MINZ   = 3
-const int F_MAXZ   = 4
-const int F_EXTMIN = 5
-const int F_SESS   = 6
-const int NF       = 7
-var array<string> FNAMES = array.from("runaway", "expiry", "superseded", "minZoneATR", "maxZoneATR", "minTap5Ext", "session", "rr")
-array<string>     FMODES = array.from(runMode, expMode, supMode, zoneMode, maxZoneMode, extMinMode, sessMode, "flag")
+// Mode per shadow filter, in F_* order ("flag" for the rr pseudo-filter).
+array<string> FMODES = array.from(runMode, expMode, supMode, zoneMode, maxZoneMode, extMinMode, sessMode, "flag")
 
 // Table corners: a table that asks for a taken corner moves to the next free one.
 f_free(string p, string u1, string u2) =>
@@ -112,13 +100,40 @@ f_free(string p, string u1, string u2) =>
                 r := c
                 break
     r
-f_pos(string p) => p == "top_left" ? position.top_left : p == "top_right" ? position.top_right : p == "bottom_left" ? position.bottom_left : position.bottom_right
 string posStats  = statsTablePos
 string posImpact = f_free(impactTablePos, posStats, "")
 string posExits  = f_free(exitsTablePos, posStats, posImpact)
 string tblSize   = tableTextSize == "small" ? size.small : tableTextSize == "normal" ? size.normal : size.tiny
 
+
+// ==== ENGINE BEGIN ====
+// Shared verbatim with "6-Tap Strategy": edit it here, then run pine/build_strategy.py.
+const string ENGINE_VERSION = "2.6"
+
+const int BRACKET = 8    // bars a tap bracket extends to the right
+const int ZONE_TR = 88   // zone fill transparency
+const int FADE_ZT = 95   // faded zone fill transparency
+const int FADE_TR = 60   // faded labels / lines transparency
+const int MID_TR  = 30   // 50% line transparency
+const int SHADOW_CAP = 5 // hidden sequences kept: SHADOW_CAP × maxActive
+const int MAX_BACK   = 9000  // drawings can't be placed ~10,000+ bars back with xloc.bar_index
+const int EXIT_CAP   = 500   // trades whose exit variants are still being resolved
+const int NV         = 9     // exit variants A–I
+
+// Shadow filter indices; "rr" (index NF) is the R:R optional flag, reported like a filter.
+const int F_RUN    = 0
+const int F_EXP    = 1
+const int F_SUP    = 2
+const int F_MINZ   = 3
+const int F_MAXZ   = 4
+const int F_EXTMIN = 5
+const int F_SESS   = 6
+const int NF       = 7
+var array<string> FNAMES = array.from("runaway", "expiry", "superseded", "minZoneATR", "maxZoneATR", "minTap5Ext", "session", "rr")
+
 string lblSize = labelSize == "tiny" ? size.tiny : labelSize == "normal" ? size.normal : labelSize == "large" ? size.large : size.small
+
+f_pos(string p) => p == "top_left" ? position.top_left : p == "top_right" ? position.top_right : p == "bottom_left" ? position.bottom_left : position.bottom_right
 
 // ───────────────────────── Types ─────────────────────────
 type Seq
@@ -160,6 +175,15 @@ type Seq
     bool   ex2 = false      // skipped under the 2-losses-a-day test
     bool   ex3 = false      // skipped under the 3-losses-a-day test
     float  risk0            // |entry - stop| at the fill
+    int    tSpawn           // times (ms) of spawn, arming, fill and the chart exit (variant A)
+    int    tArm
+    int    tFill
+    int    tExit
+    bool   sOrdered = false // strategy: an order was placed for this sequence
+    bool   sFilled = false  // strategy: the broker emulator filled it
+    int    sFillBar
+    float  sMfe = 0.0       // strategy: MFE in R since the emulator fill
+    bool   sDone = false    // strategy: order cancelled or position closed
     array<float> xs         // exit variants A–G: stop, target, result R (na = open), size left, banked R
     array<float> xt
     array<float> xr
@@ -216,7 +240,14 @@ int   ePB = bar_index - extLen
 int   iPB = bar_index - intLen
 float atr = ta.atr(14)
 
-int autoBias = nz(request.security(syminfo.tickerid, biasTF, f_bias(biasLen), lookahead = barmerge.lookahead_off))
+// Higher timeframe: the last closed HTF bar's bias ([1] with lookahead_on), so it never repaints.
+f_biasPrev(int len) =>
+    int b = f_bias(len)
+    b[1]
+
+int chartBias = f_bias(biasLen)
+int htfBias   = nz(request.security(syminfo.tickerid, biasTF, f_biasPrev(biasLen), lookahead = barmerge.lookahead_on))
+int autoBias  = biasTF == "" ? chartBias : htfBias
 int bias     = biasMode == "Auto" ? autoBias : biasMode == "Bullish" ? 1 : -1
 
 // ───────────────────────── State ─────────────────────────
@@ -283,11 +314,24 @@ f_xc(int x) => math.max(x, bar_index - MAX_BACK)
 
 // Tap label: lows below the bar, highs above.
 f_label(int b, string txt, int d, bool trendSide) =>
-    dirty.set(0, true)
-    label.new(f_xc(b), d == -1 ? low : high, txt, xloc = xloc.bar_index, yloc = (d == -1) == trendSide ? yloc.belowbar : yloc.abovebar, color = color.new(seqColor(d), 100), style = label.style_none, textcolor = seqColor(d), size = lblSize)
+    label lb = na
+    if DRAW
+        dirty.set(0, true)
+        lb := label.new(f_xc(b), d == -1 ? low : high, txt, xloc = xloc.bar_index, yloc = (d == -1) == trendSide ? yloc.belowbar : yloc.abovebar, color = color.new(seqColor(d), 100), style = label.style_none, textcolor = seqColor(d), size = lblSize)
+    lb
 
 f_hline(int b, float p, int d) =>
-    line.new(f_xc(b), p, f_xc(b + BRACKET), p, xloc = xloc.bar_index, color = seqColor(d), style = line.style_solid, width = 1)
+    line ln = na
+    if DRAW
+        ln := line.new(f_xc(b), p, f_xc(b + BRACKET), p, xloc = xloc.bar_index, color = seqColor(d), style = line.style_solid, width = 1)
+    ln
+
+// Vertical step at a break.
+f_vline(int x, float y1, float y2, color c) =>
+    line ln = na
+    if DRAW
+        ln := line.new(x, y1, x, y2, xloc = xloc.bar_index, color = c, width = 1)
+    ln
 
 f_num(float x) => na(x) ? "null" : str.tostring(math.round_to_mintick(x))
 
@@ -363,7 +407,7 @@ f_tradeLine(line ln, label lb, int x1, int x2, float p, string txt, string sfx, 
 
 // Optional setups (R:R out of range or daily limit) get faded, dashed lines.
 f_drawTrade(Seq s, int x2) =>
-    if showTradeLevels and not s.hidden
+    if showTradeLevels and DRAW and not s.hidden
         color  c   = s.opt ? color.new(seqColor(s.dir), FADE_TR) : seqColor(s.dir)
         string rrT = na(s.rr) ? "" : str.tostring(s.rr, "0.0") + "R"
         string sfx = s.opt ? " (opt " + (s.optTag == "limit" ? "limit" : rrT) + ")" : (rrT == "" ? "" : " · " + rrT)
@@ -477,7 +521,8 @@ f_cancel(Seq s, string reason) =>
             f_fade(s)
             if debugMode
                 [lb, lp] = f_lastTap(s)
-                s.lDbg := label.new(f_xc(lb), lp, reason, xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
+                if DRAW
+                    s.lDbg := label.new(f_xc(lb), lp, reason, xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
             hist.push(s)
         else
             s.delAll()
@@ -527,7 +572,8 @@ f_hide(Seq s, string reason) =>
         f_fade(v)
         if debugMode
             [lb, lp] = f_lastTap(v)
-            v.lDbg := label.new(f_xc(lb), lp, reason + " (shadow)", xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
+            if DRAW
+                v.lDbg := label.new(f_xc(lb), lp, reason + " (shadow)", xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
         hist.push(v)
     else
         v.delAll()
@@ -574,23 +620,51 @@ f_curve(string p, float r) =>
     fs.put(p + ".dd", math.max(nz(fs.get(p + ".dd")), fs.get(p + ".peak") - cum))
     p
 
-// One exit variant resolved.
+f_t(int t) => na(t) ? "" : str.format_time(t, "yyyy-MM-dd HH:mm", "America/New_York")
+
+// CSV trade log line (see the header printed on the first bar).
+f_csv(Seq s) =>
+    string tags = ""
+    for fi = 0 to NF - 1
+        if s.tags.get(fi)
+            tags += (tags == "" ? "" : "|") + FNAMES.get(fi)
+    if s.optRR
+        tags += (tags == "" ? "" : "|") + "rr"
+    if s.optTag == "limit"
+        tags += (tags == "" ? "" : "|") + "limit"
+    float  zh  = math.abs(s.p2 - s.p1)
+    string res = ""
+    for v = 0 to NV - 1
+        res += "," + str.tostring(s.xr.get(v), "0.000")
+    string ln = str.tostring(s.id) + "," + (s.dir == 1 ? "long" : "short") + "," + f_t(s.tSpawn) + "," + f_t(s.tArm) + "," + f_t(s.tFill) + "," + f_t(s.tExit)
+    ln += "," + f_num(s.entryP) + "," + f_num(s.stopP) + "," + f_num(s.tgtP) + "," + f_num(s.risk0) + "," + str.tostring(s.rr, "0.00")
+    ln += "," + str.tostring(s.zoneATR, "0.00") + "," + str.tostring(zh > 0 ? math.abs(s.p5 - s.mid) / zh : na, "0.00") + "," + str.tostring(s.b6 - s.armedBar)
+    ln += "," + (s.sess == 0 ? "NY" : s.sess == 1 ? "London" : "Asia") + "," + tags + res
+    ln += "," + str.tostring(s.risk0 > 0 ? s.mfe / s.risk0 : na, "0.000") + "," + str.tostring(s.risk0 > 0 ? s.mae / s.risk0 : na, "0.000")
+    log.info(ln)
+    s
+
+// One exit variant resolved. Variant stats count chart trades only; every trade is logged.
 f_xdone(Seq s, int v, float r) =>
     s.xr.set(v, r)
     s.xopen := s.xopen - 1
-    string p = "x" + str.tostring(v)
-    f_curve(p, r)
-    if r > 0
-        f_addf(p + ".nW", 1)
-        f_addf(p + ".w", r)
-    else if r < 0
-        f_addf(p + ".l", -r)
-    f_addf(p + ".usd", (r * s.risk0 * syminfo.pointvalue - 2 * commissionPerSide) * contracts)
+    if not s.hidden
+        string p = "x" + str.tostring(v)
+        f_curve(p, r)
+        if r > 0
+            f_addf(p + ".nW", 1)
+            f_addf(p + ".w", r)
+        else if r < 0
+            f_addf(p + ".l", -r)
+        f_addf(p + ".usd", (r * s.risk0 * syminfo.pointvalue - 2 * commissionPerSide) * contracts)
+    if s.xopen == 0 and debugLog
+        f_csv(s)
     s
 
 // Exit variants on one bar after the fill. Stop is checked first (same bar = stop);
 // stop moves and the partial take effect from the next bar.
 //   A tap 5   B 1.5R   C 2R   D 3R   E tap 5, BE at 1R   F tap 5, BE at 1.5R   G half at 1R, BE, rest to tap 5
+//   H 4R   I 5R
 f_xstep(Seq s) =>
     float fav = (s.dir == -1 ? s.entryP - low : high - s.entryP) / s.risk0
     for v = 0 to NV - 1
@@ -621,6 +695,7 @@ f_finish(Seq s, string res) =>
     float zh   = math.abs(s.p2 - s.p1)
     s.state  := 6
     s.result := res
+    s.tExit  := time
     int mask = s.optRR ? int(math.pow(2, NF)) : 0
     for fi = 0 to NF - 1
         if s.tags.get(fi)
@@ -687,6 +762,7 @@ f_arm(Seq s) =>
     if not killed
         s.state    := 4
         s.armedBar := bar_index
+        s.tArm     := time
         f_levels(s)
         float risk = math.abs(s.entryP - s.stopP)
         bool  lim  = dailyMode == "Enforce" and day.get(1) >= dailyMaxLosses
@@ -720,11 +796,13 @@ f_fill(Seq s) =>
     float risk = math.abs(s.entryP - s.stopP)
     s.state := 5
     s.b6    := bar_index
+    s.tFill := time
     s.sess  := f_session()
     s.risk0 := risk
     if not s.hidden
-        s.l6   := label.new(bar_index, s.entryP, "6", xloc = xloc.bar_index, color = color.new(c, 100), style = s.dir == -1 ? label.style_label_down : label.style_label_up, textcolor = c, size = lblSize)
-        s.lDot := label.new(bar_index, s.entryP, "", xloc = xloc.bar_index, color = c, style = label.style_circle, size = size.tiny)
+        if DRAW
+            s.l6   := label.new(bar_index, s.entryP, "6", xloc = xloc.bar_index, color = color.new(c, 100), style = s.dir == -1 ? label.style_label_down : label.style_label_up, textcolor = c, size = lblSize)
+            s.lDot := label.new(bar_index, s.entryP, "", xloc = xloc.bar_index, color = c, style = label.style_circle, size = size.tiny)
         box.set_right(s.zone, bar_index)
         line.set_x2(s.midLn, bar_index)
         line.set_x2(s.h4, f_xc(math.min(s.b4 + BRACKET, bar_index)))
@@ -736,16 +814,16 @@ f_fill(Seq s) =>
         // Daily-limit test: skipped if the day's limit was already reached (optional trades are always skipped).
         s.ex2 := s.opt or day.get(2) >= 2
         s.ex3 := s.opt or day.get(3) >= 3
-        // Exit variants A–G, resolved in parallel from the same bars.
-        if risk > 0
-            float e = s.entryP
-            int   d = s.dir
-            s.xs    := array.new_float(NV, s.stopP)
-            s.xt    := array.from(s.tgtP, e + d * 1.5 * risk, e + d * 2.0 * risk, e + d * 3.0 * risk, s.tgtP, s.tgtP, s.tgtP)
-            s.xr    := array.new_float(NV, na)
-            s.xrem  := array.new_float(NV, 1.0)
-            s.xbank := array.new_float(NV, 0.0)
-            s.xopen := NV
+    // Exit variants A–I, resolved in parallel from the same bars (shadow trades too, for the log).
+    if risk > 0
+        float e = s.entryP
+        int   d = s.dir
+        s.xs    := array.new_float(NV, s.stopP)
+        s.xt    := array.from(s.tgtP, e + d * 1.5 * risk, e + d * 2.0 * risk, e + d * 3.0 * risk, s.tgtP, s.tgtP, s.tgtP, e + d * 4.0 * risk, e + d * 5.0 * risk)
+        s.xr    := array.new_float(NV, na)
+        s.xrem  := array.new_float(NV, 1.0)
+        s.xbank := array.new_float(NV, 0.0)
+        s.xopen := NV
     trades.push(s)
     // Stop touched on the fill bar itself (order unknown -> assume stop).
     if s.dir == -1 ? high >= s.stopP : low <= s.stopP
@@ -821,6 +899,7 @@ f_spawn(int d, int b1, float p1, int b2, float p2) =>
             f_cancel(ev, "evict")
         s.id       := nz(cnt.get("_id")) + 1
         s.spawnBar := bar_index
+        s.tSpawn   := time
         f_inc("_id")
         if ghost
             s.tagBar := bar_index
@@ -837,13 +916,14 @@ f_spawn(int d, int b1, float p1, int b2, float p2) =>
             s.l2    := f_label(b2, "2", d, false)
             s.h1    := f_hline(b1, p1, d)
             s.h2    := f_hline(b2, p2, d)
-            s.zone  := box.new(f_xc(b1), top, bar_index, bot, xloc = xloc.bar_index, border_color = color.new(c, ZONE_TR), border_width = 1, bgcolor = color.new(c, ZONE_TR))
-            s.midLn := line.new(f_xc(b1), s.mid, bar_index, s.mid, xloc = xloc.bar_index, color = color.new(c, MID_TR), style = line.style_dashed, width = 1)
+            if DRAW
+                s.zone  := box.new(f_xc(b1), top, bar_index, bot, xloc = xloc.bar_index, border_color = color.new(c, ZONE_TR), border_width = 1, bgcolor = color.new(c, ZONE_TR))
+                s.midLn := line.new(f_xc(b1), s.mid, bar_index, s.mid, xloc = xloc.bar_index, color = color.new(c, MID_TR), style = line.style_dashed, width = 1)
             if s.state == 1
                 line.set_x2(s.h1, f_xc(math.min(b1 + BRACKET, s.brk3)))
                 s.l3 := f_label(s.b3, "3", d, true)
                 s.h3 := f_hline(s.b3, s.p3, d)
-                s.v3 := line.new(s.brk3, p1, s.brk3, s.p3, xloc = xloc.bar_index, color = c, width = 1)
+                s.v3 := f_vline(s.brk3, p1, s.p3, c)
         pool.push(s)
     s
 
@@ -954,7 +1034,7 @@ if barstate.isconfirmed
                             line.set_x2(s.h1, f_xc(math.min(s.b1 + BRACKET, bar_index)))
                             s.l3 := f_label(s.b3, "3", d, true)
                             s.h3 := f_hline(s.b3, s.p3, d)
-                            s.v3 := line.new(bar_index, s.p1, bar_index, s.p3, xloc = xloc.bar_index, color = c, width = 1)
+                            s.v3 := f_vline(bar_index, s.p1, s.p3, c)
                 else if s.state == 1
                     // Tap 3 tracks the extreme until tap 4 forms.
                     float ex = f_trendExt(d)
@@ -993,7 +1073,7 @@ if barstate.isconfirmed
                             line.set_x2(s.h3, f_xc(math.min(s.b3 + BRACKET, bar_index)))
                             s.l5 := f_label(s.b5, "5", d, true)
                             s.h5 := f_hline(s.b5, s.p5, d)
-                            s.v5 := line.new(bar_index, s.p3, bar_index, s.p5, xloc = xloc.bar_index, color = c, width = 1)
+                            s.v5 := f_vline(bar_index, s.p3, s.p5, c)
                 else if s.state == 3
                     // Tap 5 trails the extreme and locks on an opposite internal pivot after it, or a touch of the entry.
                     f_trail5(s)
@@ -1122,30 +1202,10 @@ if barstate.isconfirmed
                 label.set_text(L.get(j), txt)
                 label.set_textcolor(L.get(j), col)
 
-// ───────────────────────── Debug tables ─────────────────────────
-var table dbg = na
-var table imp = na
-var table exT = na
-
+// ───────────────────────── Stats helpers ─────────────────────────
 f_pct(float x) => na(x) ? "–" : str.tostring(100 * x, "0.0") + "%"
 f_r(float x)   => na(x) ? "–" : (x > 0 ? "+" : "") + str.tostring(x, "0.00") + "R"
 f_ratio(float x) => na(x) ? "–" : str.tostring(x, "0.00")
-
-// Trades · win rate · expectancy for one direction suffix ("", ".L", ".S").
-f_side(string sfx) =>
-    float n  = nz(fs.get("n" + sfx))
-    float nW = nz(fs.get("nW" + sfx))
-    float ex = n > 0 ? (nz(fs.get("winR" + sfx)) - nz(fs.get("lossR" + sfx))) / n : na
-    str.tostring(n, "0") + " · " + f_pct(n > 0 ? nW / n : na) + " · " + f_r(ex)
-
-f_kv(array<string> K, array<string> V, string k, string v) =>
-    K.push(k)
-    V.push(v)
-    k
-
-f_cell(table t, int col, int row, string txt) =>
-    table.cell(t, col, row, txt, text_color = color.gray, text_size = tblSize, text_halign = col == 0 ? text.align_left : text.align_right)
-    row
 
 // Count, win rate, expectancy, median R and expectancy without the 5 largest wins.
 f_robust(array<float> X) =>
@@ -1173,6 +1233,32 @@ f_robust(array<float> X) =>
         md  := X.median()
         ex5 := n - k > 0 ? (sum - top) / (n - k) : na
     [n, wr, ex, md, ex5]
+// ==== ENGINE END ====
+
+// ───────────────────────── Debug tables ─────────────────────────
+var table dbg = na
+var table imp = na
+var table exT = na
+
+const color TBL_BG  = #131722
+const color TBL_TXT = #B2B5BE
+
+
+// Trades · win rate · expectancy for one direction suffix ("", ".L", ".S").
+f_side(string sfx) =>
+    float n  = nz(fs.get("n" + sfx))
+    float nW = nz(fs.get("nW" + sfx))
+    float ex = n > 0 ? (nz(fs.get("winR" + sfx)) - nz(fs.get("lossR" + sfx))) / n : na
+    str.tostring(n, "0") + " · " + f_pct(n > 0 ? nW / n : na) + " · " + f_r(ex)
+
+f_kv(array<string> K, array<string> V, string k, string v) =>
+    K.push(k)
+    V.push(v)
+    k
+
+f_cell(table t, int col, int row, string txt) =>
+    table.cell(t, col, row, txt, text_color = TBL_TXT, text_size = tblSize, text_halign = col == 0 ? text.align_left : text.align_right)
+    row
 
 f_robHead(table t, int row, string title) =>
     f_cell(t, 0, row, title)
@@ -1196,7 +1282,7 @@ f_robRow(table t, int row, string name, array<float> X) =>
 // ── Stats (chart view) ──
 if debugMode and barstate.islast
     if na(dbg)
-        dbg := table.new(f_pos(posStats), 2, 50, bgcolor = color.new(color.gray, 90), frame_width = 0, border_width = 0)
+        dbg := table.new(f_pos(posStats), 2, 50, bgcolor = TBL_BG, frame_width = 0, border_width = 0)
     int   nFill = nz(cnt.get("filled"))
     int   nTgt  = nz(cnt.get("target"))
     int   nStop = nz(cnt.get("stop"))
@@ -1285,7 +1371,7 @@ f_bucketRows(table t, int row0, string title, array<int> K, array<string> names,
 
 if debugMode and debugBreakdown and barstate.islast
     if na(imp)
-        imp := table.new(f_pos(posImpact), 6, 60, bgcolor = color.new(color.gray, 90), frame_width = 0, border_width = 0)
+        imp := table.new(f_pos(posImpact), 6, 60, bgcolor = TBL_BG, frame_width = 0, border_width = 0)
     int N    = trR.size()
     int half = int(math.floor(N / 2))
     int row  = 0
@@ -1343,12 +1429,12 @@ f_curveRow(table t, int row, string name, string p) =>
 
 if debugMode and debugExits and barstate.islast
     if na(exT)
-        exT := table.new(f_pos(posExits), 7, 40, bgcolor = color.new(color.gray, 90), frame_width = 0, border_width = 0)
+        exT := table.new(f_pos(posExits), 7, 40, bgcolor = TBL_BG, frame_width = 0, border_width = 0)
     int row = 0
     for [ci, h] in array.from("Exit variant (chart trades)", "Win", "Avg win", "Exp", "PF", "Max DD", "Net $")
         f_cell(exT, ci, row, h)
     row += 1
-    for [v, nm] in array.from("A  tap 5 (chart)", "B  1.5R", "C  2R", "D  3R", "E  tap 5, BE at 1R", "F  tap 5, BE at 1.5R", "G  ½ at 1R, BE, tap 5")
+    for [v, nm] in array.from("A  tap 5 (chart)", "B  1.5R", "C  2R", "D  3R", "E  tap 5, BE at 1R", "F  tap 5, BE at 1.5R", "G  ½ at 1R, BE, tap 5", "H  4R", "I  5R")
         string p  = "x" + str.tostring(v)
         float  n  = nz(fs.get(p + ".n"))
         float  nW = nz(fs.get(p + ".nW"))
@@ -1362,8 +1448,12 @@ if debugMode and debugExits and barstate.islast
         f_cell(exT, 5, row, f_r(-nz(fs.get(p + ".dd"))))
         f_cell(exT, 6, row, str.tostring(nz(fs.get(p + ".usd")), "#,##0.00"))
         row += 1
+    int nX = 0
+    for x in exitTrk
+        if not x.hidden
+            nX += 1
     f_cell(exT, 0, row, "  still open")
-    f_cell(exT, 1, row, str.tostring(exitTrk.size()))
+    f_cell(exT, 1, row, str.tostring(nX))
     row += 1
     if dailyMode != "Off"
         for [ci, h] in array.from("Daily loss limit (day from 18:00 ET)", "n", "", "Exp", "", "Max DD", "")
@@ -1389,6 +1479,10 @@ if debugMode and debugExits and barstate.islast
         f_cell(exT, 0, row, "  Winners with MAE ≤ " + str.tostring(th, "0.0#") + "R  (" + str.tostring(winMAE.size()) + ")")
         f_cell(exT, 1, row, f_pct(f_share(winMAE, th, false)))
         row += 1
+
+// ───────────────────────── Trade log header ─────────────────────────
+if debugLog and barstate.isfirst
+    log.info("id,dir,spawn_time,arm_time,fill_time,exit_time,entry,stop,target,risk_pts,planned_rr,zone_h_atr,tap5_ext_zones,bars_arm_fill,session,tags,result_A,result_B,result_C,result_D,result_E,result_F,result_G,result_H,result_I,mfe_r,mae_r")
 
 // ───────────────────────── Alert conditions (UI dropdown) ─────────────────────────
 alertcondition(fl.get(0), "6-Tap armed (short)",  '{"event":"armed","dir":"short","symbol":"{{ticker}}","tf":"{{interval}}","price":{{close}}}')
