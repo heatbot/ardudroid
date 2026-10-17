@@ -162,6 +162,13 @@ best month's share of net profit, missed fills, and the pass bar
 Higher-timeframe bias in both scripts uses the last closed HTF bar
 (`expr[1]` with `lookahead_on`), so it does not repaint.
 
+## History buffer
+Both scripts declare `max_bars_back = 5000`. Drawings placed with `xloc.bar_index` read `time[]`
+at their x offset, so every drawing x goes through `f_xc()` (no older than 4,900 bars), and series
+lookups at offsets derived from old bars (FVG scan, confirmation-level fallback) are clamped to
+4,990. A fill or exit long after arming therefore draws its old segments from at most 4,900 bars
+back instead of stopping the script.
+
 ## Notes
 - The engine only changes state on confirmed bars, and pivots are drawn back on
   their pivot bar after confirmation, so drawings do not repaint.

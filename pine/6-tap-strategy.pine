@@ -14,7 +14,7 @@ strategy("6-Tap Strategy", overlay = true,
      backtest_fill_limits_assumption = 1,
      use_bar_magnifier = true,
      process_orders_on_close = false,
-     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 200, max_bars_back = 500)
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 200, max_bars_back = 5000)
 
 // ───────────────────────── Inputs ─────────────────────────
 // ==== SHARED INPUTS BEGIN ====  (copied into "6-Tap Strategy" by pine/build_strategy.py)
@@ -120,7 +120,7 @@ string tblSize           = tableTextSize == "small" ? size.small : tableTextSize
 
 // ==== ENGINE BEGIN ====
 // Shared verbatim with "6-Tap Strategy": edit it here, then run pine/build_strategy.py.
-const string ENGINE_VERSION = "2.9"
+const string ENGINE_VERSION = "2.9.1"
 
 const int BRACKET = 8    // bars a tap bracket extends to the right
 const int ZONE_TR = 88   // zone fill transparency
@@ -130,7 +130,11 @@ const int MID_TR  = 30   // 50% line transparency
 const int LIQ_TR  = 30   // liquidity line transparency
 const color FVG_COL = #787B86
 const int SHADOW_CAP = 5 // hidden sequences kept: SHADOW_CAP × maxActive
-const int MAX_BACK   = 9000  // drawings can't be placed ~10,000+ bars back with xloc.bar_index
+// History buffer is max_bars_back = 5000 (both scripts). A bar_index drawing reads time[] at its
+// x offset, so drawing x positions are clamped to MAX_BACK; series reads at offsets derived from
+// old bars are clamped to MAX_OFF.
+const int MAX_BACK   = 4900  // oldest drawing x offset (f_xc)
+const int MAX_OFF    = 4990  // oldest series offset for close[] / high[] / low[] lookups
 const int TRK_CAP    = 800   // entry trackers kept (pending or with exit variants still open)
 const int NV         = 12    // exit variants A–L
 const int NM         = 3     // entry modes: 0 50% limit, 1 tap 4 sweep limit, 2 confirmation
@@ -941,7 +945,7 @@ f_fvgFind(Seq s) =>
     float top  = math.max(s.p1, s.p2)
     float bot  = math.min(s.p1, s.p2)
     int   oNew = bar_index - s.brk3
-    int   oOld = math.min(bar_index - s.b2 - 2, oNew + 300)
+    int   oOld = math.min(math.min(bar_index - s.b2 - 2, oNew + 300), MAX_OFF - 2)
     float best = na
     if oOld >= oNew
         for o = oNew to oOld
@@ -1191,8 +1195,8 @@ f_cl(Trk t, int d) =>
                 cl := t.fp.get(j)
                 break
     if na(cl)
-        int hiOff = bar_index - t.sweepBar
-        int loOff = bar_index - t.peakBar + 1
+        int hiOff = math.min(bar_index - t.sweepBar, MAX_OFF)
+        int loOff = math.min(bar_index - t.peakBar + 1, hiOff + 1)
         if loOff > hiOff
             cl := d == -1 ? low[hiOff] : high[hiOff]
         else

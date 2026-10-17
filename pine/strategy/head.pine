@@ -14,7 +14,7 @@ strategy("6-Tap Strategy", overlay = true,
      backtest_fill_limits_assumption = 1,
      use_bar_magnifier = true,
      process_orders_on_close = false,
-     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 200, max_bars_back = 500)
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 200, max_bars_back = 5000)
 
 // ───────────────────────── Inputs ─────────────────────────
 //@@SHARED_INPUTS@@
