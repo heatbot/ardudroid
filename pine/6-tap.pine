@@ -1,5 +1,5 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// 6-Tap v2.3 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
+// 6-Tap v2.4 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
 // Bearish model shown in comments; bullish is the exact mirror.
 //   Tap 1  external swing low (liquidity)      Tap 2  external swing high (protected)
 //   Zone   tap 1 .. tap 2, mid = 50%           Tap 3  big BOS / sweep of tap 1
@@ -15,6 +15,7 @@ const string G_STR  = "Structure"
 const string G_RULE = "Rules"
 const string G_TRD  = "Trade"
 const string G_DSP  = "Display"
+const string G_FLT  = "Shadow filters"
 const string G_DBG  = "Debug"
 
 string biasMode       = input.string("Auto", "Bias mode", options = ["Auto", "Bullish", "Bearish"], group = G_BIAS)
@@ -42,6 +43,12 @@ int    targetExtTicks = input.int(0, "Target extension (ticks)", minval = 0, gro
 float  fixedR         = input.float(2.0, "Fixed R", minval = 0.1, step = 0.1, group = G_TRD)
 float  stopBufferATR  = input.float(0.1, "Stop buffer (× ATR 14)", minval = 0, step = 0.05, group = G_TRD)
 
+const string FLT_TIP = "Off: rule not applied. Shadow: never cancels; tags the sequence, hides it from the chart and keeps resolving it in the background for the impact table. Enforce: cancels."
+string runMode  = input.string("Shadow", "runaway (max tap 5 extension)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
+string expMode  = input.string("Shadow", "expiry (bars after arming)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
+string supMode  = input.string("Shadow", "superseded (one armed order per direction)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
+string zoneMode = input.string("Shadow", "minZoneATR (min zone size)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
+
 bool   showTradeLevels = input.bool(true, "Show trade levels", group = G_DSP)
 int    keepHistory     = input.int(5, "Finished / cancelled sequences to keep", minval = 0, group = G_DSP)
 bool   keepCancelled   = input.bool(true, "Keep cancelled sequences (faded)", group = G_DSP)
@@ -52,12 +59,14 @@ string labelSize       = input.string("small", "Label size", options = ["tiny", 
 bool   debugMode       = input.bool(false, "Debug mode (kill reasons + stats table)", group = G_DBG)
 float  commissionPerSide = input.float(0.62, "Commission per side ($ per contract)", minval = 0, step = 0.01, group = G_DBG)
 int    contracts       = input.int(1, "Contracts", minval = 1, group = G_DBG)
+bool   debugBreakdown  = input.bool(true, "Filter impact table", group = G_DBG)
 
 const int BRACKET = 8    // bars a tap bracket extends to the right
 const int ZONE_TR = 88   // zone fill transparency
 const int FADE_ZT = 95   // faded zone fill transparency
 const int FADE_TR = 60   // faded labels / lines transparency
 const int MID_TR  = 30   // 50% line transparency
+const int SHADOW_CAP = 5 // hidden sequences kept: SHADOW_CAP × maxActive
 
 string lblSize = labelSize == "tiny" ? size.tiny : labelSize == "normal" ? size.normal : labelSize == "large" ? size.large : size.small
 
@@ -88,6 +97,14 @@ type Seq
     string result = ""      // "", "target", "stop" or a cancel reason
     bool   faded = false
     float  mfe = 0.0        // max favorable excursion after the fill, in price
+    bool   hidden = false   // shadow-kept: runs for stats, never drawn or alerted
+    bool   tRun = false     // shadow tags: would have been cancelled by runaway ...
+    bool   tExp = false     // ... expiry
+    bool   tSup = false     // ... superseded
+    bool   tZone = false    // ... minZoneATR
+    int    tagBar           // bar of the first shadow tag
+    float  zoneATR          // zone height in ATR at spawn
+    int    sess             // fill session: 0 NY, 1 London, 2 Asia
     label  l1
     label  l2
     label  l3
@@ -145,6 +162,18 @@ int bias     = biasMode == "Auto" ? autoBias : biasMode == "Bullish" ? 1 : -1
 var array<Seq> active = array.new<Seq>()   // states 0–4
 var array<Seq> trades = array.new<Seq>()   // state 5
 var array<Seq> hist   = array.new<Seq>()   // finished or cancelled, faded
+var array<Seq> shadow = array.new<Seq>()   // hidden (shadow-kept) states 0–4
+
+// One entry per resolved trade, visible or shadow: R, shadow tags and buckets.
+var array<float> trR    = array.new<float>()
+var array<bool>  trRun  = array.new<bool>()
+var array<bool>  trExp  = array.new<bool>()
+var array<bool>  trSup  = array.new<bool>()
+var array<bool>  trZn   = array.new<bool>()
+var array<int>   trSess = array.new<int>()
+var array<int>   trExt  = array.new<int>()   // tap 5 extension from mid: 0 <1, 1 1–2, 2 2–3, 3 >3 zone heights
+var array<int>   trZh   = array.new<int>()   // zone height in ATR, same buckets
+var array<int>   trA2F  = array.new<int>()   // bars arm -> fill: 0 ≤10, 1 11–40, 2 >40
 
 var map<string, int> cnt = map.new<string, int>()   // debug counters
 var array<float> acc   = array.new_float(2, 0.0)   // [unused, sum of bars arm -> fill]
@@ -229,7 +258,8 @@ f_runaway(Seq s) => math.abs(s.mid - s.p5) > maxTap5Ext * math.abs(s.p2 - s.p1)
 
 f_alert(string ev, Seq s, string reason) =>
     string msg = '{"event":"' + ev + '","dir":"' + (s.dir == 1 ? "long" : "short") + '","entry":' + f_num(s.entryP) + ',"stop":' + f_num(s.stopP) + ',"target":' + f_num(s.tgtP) + (reason != "" ? ',"reason":"' + reason + '"' : "") + ',"symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '"}'
-    alert(msg, alert.freq_once_per_bar_close)
+    if not s.hidden
+        alert(msg, alert.freq_once_per_bar_close)
     s
 
 // Recalculate mid and move the zone drawings after tap 2 changes.
@@ -260,7 +290,7 @@ f_tradeLine(line ln, label lb, int x1, int x2, float p, string txt, color c, str
     [l, lb2]
 
 f_drawTrade(Seq s, int x2) =>
-    if showTradeLevels
+    if showTradeLevels and not s.hidden
         color c = seqColor(s.dir)
         [el, eb] = f_tradeLine(s.eLn, s.eLb, s.armedBar, x2, s.entryP, s.dir == 1 ? "Long" : "Short", c, line.style_solid)
         [sl, sb] = f_tradeLine(s.sLn, s.sLb, s.armedBar, x2, s.stopP, "Stop", c, line.style_dotted)
@@ -350,94 +380,203 @@ f_lastTap(Seq s) =>
     [b, p]
 
 // Cancel before fill: pull trade lines, freeze, fade (or delete), log the reason.
+// A hidden (shadow) sequence just stops; it has no drawings or alerts.
 f_cancel(Seq s, string reason) =>
-    bool wasArmed = s.state == 4
-    bool keep     = keepCancelled and (s.state > 0 or debugMode)
-    f_inc("cancelled")
-    f_inc(reason)
-    if wasArmed
-        f_alert("cancelled", s, reason)
-        fl.set(4, true)
-    s.state  := 6
-    s.result := reason
-    f_delTrade(s)
-    box.set_right(s.zone, bar_index)
-    line.set_x2(s.midLn, bar_index)
-    if keep
-        f_fade(s)
-        if debugMode
-            [lb, lp] = f_lastTap(s)
-            s.lDbg := label.new(lb, lp, reason, xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
-        hist.push(s)
+    if s.hidden
+        s.state  := 6
+        s.result := reason
     else
-        s.delAll()
+        bool wasArmed = s.state == 4
+        bool keep     = keepCancelled and (s.state > 0 or debugMode)
+        f_inc("cancelled")
+        f_inc(reason)
+        if wasArmed
+            f_alert("cancelled", s, reason)
+            fl.set(4, true)
+        s.state  := 6
+        s.result := reason
+        f_delTrade(s)
+        box.set_right(s.zone, bar_index)
+        line.set_x2(s.midLn, bar_index)
+        if keep
+            f_fade(s)
+            if debugMode
+                [lb, lp] = f_lastTap(s)
+                s.lDbg := label.new(lb, lp, reason, xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
+            hist.push(s)
+        else
+            s.delAll()
     s
 
-// Trade result after a fill.
+f_nullDraw(Seq s) =>
+    s.l1    := na
+    s.l2    := na
+    s.l3    := na
+    s.l4    := na
+    s.l5    := na
+    s.l6    := na
+    s.lDot  := na
+    s.lDbg  := na
+    s.h1    := na
+    s.h2    := na
+    s.h3    := na
+    s.h4    := na
+    s.h5    := na
+    s.v3    := na
+    s.v5    := na
+    s.zone  := na
+    s.midLn := na
+    s.eLn   := na
+    s.sLn   := na
+    s.tLn   := na
+    s.eLb   := na
+    s.sLb   := na
+    s.tLb   := na
+    s
+
+// Shadow tag on a visible sequence: the chart shows the Enforce view (a faded,
+// cancelled copy keeps the drawings) while the sequence itself runs on hidden.
+f_hide(Seq s, string reason) =>
+    Seq v = s.copy()
+    v.state  := 6
+    v.result := reason
+    f_inc("cancelled")
+    f_inc(reason)
+    if s.state == 4
+        f_alert("cancelled", s, reason)
+        fl.set(4, true)
+    f_delTrade(v)
+    box.set_right(v.zone, bar_index)
+    line.set_x2(v.midLn, bar_index)
+    if keepCancelled
+        f_fade(v)
+        if debugMode
+            [lb, lp] = f_lastTap(v)
+            v.lDbg := label.new(lb, lp, reason + " (shadow)", xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
+        hist.push(v)
+    else
+        v.delAll()
+    s.hidden := true
+    f_nullDraw(s)
+    s
+
+// Invented filter. Enforce cancels; Shadow tags once (and hides a visible
+// sequence) but lets it run; Off does nothing. Returns true when cancelled.
+f_filter(Seq s, string filt, string mode) =>
+    bool killed = false
+    bool tagged = filt == "runaway" ? s.tRun : filt == "expiry" ? s.tExp : filt == "superseded" ? s.tSup : s.tZone
+    if mode == "Enforce"
+        f_cancel(s, filt)
+        killed := true
+    else if mode == "Shadow" and not tagged
+        if filt == "runaway"
+            s.tRun := true
+        else if filt == "expiry"
+            s.tExp := true
+        else if filt == "superseded"
+            s.tSup := true
+        else
+            s.tZone := true
+        if na(s.tagBar)
+            s.tagBar := bar_index
+        f_inc("tag." + filt)
+        if not s.hidden
+            f_hide(s, filt)
+    killed
+
 f_addf(string k, float v) =>
     fs.put(k, nz(fs.get(k)) + v)
     k
 
+f_bucket4(float x) => na(x) ? -1 : x < 1 ? 0 : x < 2 ? 1 : x < 3 ? 2 : 3
+
+// Trade result after a fill. Visible trades feed the chart stats; every trade
+// (visible or shadow) is recorded for the filter impact table.
 f_finish(Seq s, string res) =>
     bool  win  = res == "target"
     float risk = math.abs(s.entryP - s.stopP)
     float pts  = s.dir * ((win ? s.tgtP : s.stopP) - s.entryP)   // per contract
     float r    = risk > 0 ? pts / risk : 0.0
+    float zh   = math.abs(s.p2 - s.p1)
     s.state  := 6
     s.result := res
-    f_inc(res)
-    // Magnitude stats: totals and per direction (".L" / ".S").
-    for sfx in array.from("", s.dir == 1 ? ".L" : ".S")
-        f_addf("n" + sfx, 1)
-        f_addf((win ? "nW" : "nL") + sfx, 1)
-        f_addf((win ? "winR" : "lossR") + sfx, math.abs(r))
-    f_addf("pts", pts * contracts)
-    f_addf("usd", (pts * syminfo.pointvalue - 2 * commissionPerSide) * contracts)
-    float cum = nz(fs.get("cum")) + r
-    fs.put("cum", cum)
-    fs.put("peak", math.max(nz(fs.get("peak")), cum))
-    fs.put("dd", math.max(nz(fs.get("dd")), fs.get("peak") - cum))
-    fs.put("streak", win ? 0.0 : nz(fs.get("streak")) + 1)
-    fs.put("maxStreak", math.max(nz(fs.get("maxStreak")), fs.get("streak")))
-    if win
-        fs.put("bigWin", math.max(nz(fs.get("bigWin")), r))
-    else
-        f_addf("mfeStop", risk > 0 ? s.mfe / risk : 0.0)
-    f_alert(res, s, "")
-    fl.set(res == "target" ? 5 : 6, true)
-    f_delTrade(s)
-    f_fade(s)
-    hist.push(s)
+    trR.push(r)
+    trRun.push(s.tRun)
+    trExp.push(s.tExp)
+    trSup.push(s.tSup)
+    trZn.push(s.tZone)
+    trSess.push(s.sess)
+    trExt.push(f_bucket4(zh > 0 ? math.abs(s.p5 - s.mid) / zh : na))
+    trZh.push(f_bucket4(s.zoneATR))
+    int a2f = s.b6 - s.armedBar
+    trA2F.push(a2f <= 10 ? 0 : a2f <= 40 ? 1 : 2)
+    if not s.hidden
+        f_inc(res)
+        // Magnitude stats: totals and per direction (".L" / ".S").
+        for sfx in array.from("", s.dir == 1 ? ".L" : ".S")
+            f_addf("n" + sfx, 1)
+            f_addf((win ? "nW" : "nL") + sfx, 1)
+            f_addf((win ? "winR" : "lossR") + sfx, math.abs(r))
+        f_addf("pts", pts * contracts)
+        f_addf("usd", (pts * syminfo.pointvalue - 2 * commissionPerSide) * contracts)
+        float cum = nz(fs.get("cum")) + r
+        fs.put("cum", cum)
+        fs.put("peak", math.max(nz(fs.get("peak")), cum))
+        fs.put("dd", math.max(nz(fs.get("dd")), fs.get("peak") - cum))
+        fs.put("streak", win ? 0.0 : nz(fs.get("streak")) + 1)
+        fs.put("maxStreak", math.max(nz(fs.get("maxStreak")), fs.get("streak")))
+        if win
+            fs.put("bigWin", math.max(nz(fs.get("bigWin")), r))
+        else
+            f_addf("mfeStop", risk > 0 ? s.mfe / risk : 0.0)
+        f_alert(res, s, "")
+        fl.set(res == "target" ? 5 : 6, true)
+        f_delTrade(s)
+        f_fade(s)
+        hist.push(s)
     s
 
-// Tap 5 locked: final levels, trade lines, one armed order per direction.
+// Tap 5 locked: final levels, one armed order per direction.
+// A hidden sequence never supersedes a visible one (it does not exist in the Enforce view).
 f_arm(Seq s) =>
     s.state    := 4
     s.armedBar := bar_index
     f_levels(s)
-    for o in active
-        if o.id != s.id and o.dir == s.dir and o.state == 4
-            f_cancel(o, "superseded")
-    f_inc("armed")
-    f_alert("armed", s, "")
-    fl.set(s.dir == 1 ? 1 : 0, true)
+    if supMode != "Off"
+        for o in active
+            if o.id != s.id and o.dir == s.dir and o.state == 4 and (not s.hidden or o.hidden)
+                f_filter(o, "superseded", supMode)
+        for o in shadow
+            if o.id != s.id and o.dir == s.dir and o.state == 4
+                f_filter(o, "superseded", supMode)
+    if not s.hidden
+        f_inc("armed")
+        f_alert("armed", s, "")
+        fl.set(s.dir == 1 ? 1 : 0, true)
     s
+
+// Session of the current bar in New York time: 0 NY 09:30–16:00, 1 London 03:00–09:30, 2 Asia.
+f_session() =>
+    int m = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+    m >= 570 and m < 960 ? 0 : m >= 180 and m < 570 ? 1 : 2
 
 // Tap 6: sweep of tap 4 into the entry level.
 f_fill(Seq s) =>
     color c = seqColor(s.dir)
     s.state := 5
     s.b6    := bar_index
-    s.l6    := label.new(bar_index, s.entryP, "6", xloc = xloc.bar_index, color = color.new(c, 100), style = s.dir == -1 ? label.style_label_down : label.style_label_up, textcolor = c, size = lblSize)
-    s.lDot  := label.new(bar_index, s.entryP, "", xloc = xloc.bar_index, color = c, style = label.style_circle, size = size.tiny)
-    box.set_right(s.zone, bar_index)
-    line.set_x2(s.midLn, bar_index)
-    line.set_x2(s.h4, math.min(s.b4 + BRACKET, bar_index))
-    f_drawTrade(s, bar_index + BRACKET)
-    f_inc("filled")
-    acc.set(1, acc.get(1) + (bar_index - s.armedBar))
-    f_alert("filled", s, "")
-    fl.set(s.dir == 1 ? 3 : 2, true)
+    s.sess  := f_session()
+    if not s.hidden
+        s.l6   := label.new(bar_index, s.entryP, "6", xloc = xloc.bar_index, color = color.new(c, 100), style = s.dir == -1 ? label.style_label_down : label.style_label_up, textcolor = c, size = lblSize)
+        s.lDot := label.new(bar_index, s.entryP, "", xloc = xloc.bar_index, color = c, style = label.style_circle, size = size.tiny)
+        box.set_right(s.zone, bar_index)
+        line.set_x2(s.midLn, bar_index)
+        line.set_x2(s.h4, math.min(s.b4 + BRACKET, bar_index))
+        f_drawTrade(s, bar_index + BRACKET)
+        f_inc("filled")
+        acc.set(1, acc.get(1) + (bar_index - s.armedBar))
+        f_alert("filled", s, "")
+        fl.set(s.dir == 1 ? 3 : 2, true)
     trades.push(s)
     // Stop touched on the fill bar itself (order unknown -> assume stop).
     if s.dir == -1 ? high >= s.stopP : low <= s.stopP
@@ -446,12 +585,15 @@ f_fill(Seq s) =>
 
 // Spawn a sequence from a confirmed leg. Bars between tap 2 and now (the pivot
 // confirmation window) are replayed so a tap-1 break inside it is not missed.
+// A zone below minZoneATR is skipped (Enforce), or spawned hidden and tagged (Shadow).
 f_spawn(int d, int b1, float p1, int b2, float p2) =>
-    float top = math.max(p1, p2)
-    float bot = math.min(p1, p2)
-    float hgt = top - bot
-    bool  ok  = hgt > 0 and (minZoneATR <= 0 or (not na(atr) and hgt >= minZoneATR * atr))
-    Seq s = Seq.new(dir = d, b1 = b1, p1 = p1, b2 = b2, p2 = p2, mid = (p1 + p2) / 2)
+    float top   = math.max(p1, p2)
+    float bot   = math.min(p1, p2)
+    float hgt   = top - bot
+    bool  small = zoneMode != "Off" and minZoneATR > 0 and (na(atr) or hgt < minZoneATR * atr)
+    bool  ghost = small and zoneMode == "Shadow"
+    bool  ok    = hgt > 0 and not (small and zoneMode == "Enforce")
+    Seq s = Seq.new(dir = d, b1 = b1, p1 = p1, b2 = b2, p2 = p2, mid = (p1 + p2) / 2, hidden = ghost, zoneATR = na(atr) or atr == 0 ? na : hgt / atr)
     if ok
         for k = 1 to extLen - 1
             int   i  = extLen - k
@@ -473,11 +615,12 @@ f_spawn(int d, int b1, float p1, int b2, float p2) =>
                 if d == -1 ? lo < s.p3 : hi > s.p3
                     s.p3 := ex
                     s.b3 := bar_index - i
-    // Dedupe against active same-direction zones.
+    // Dedupe against same-direction zones in the same pool (visible or shadow).
+    array<Seq> pool = ghost ? shadow : active
     array<int> repl = array.new<int>()
-    if ok and active.size() > 0
-        for j = 0 to active.size() - 1
-            Seq o = active.get(j)
+    if ok and pool.size() > 0
+        for j = 0 to pool.size() - 1
+            Seq o = pool.get(j)
             if o.dir == d
                 float ot = math.max(o.p1, o.p2)
                 float ob = math.min(o.p1, o.p2)
@@ -491,32 +634,38 @@ f_spawn(int d, int b1, float p1, int b2, float p2) =>
     if ok
         if repl.size() > 0
             for j = repl.size() - 1 to 0
-                Seq o = active.remove(repl.get(j))
+                Seq o = pool.remove(repl.get(j))
                 o.delAll()
-        // Cap: evict the least-advanced candidate, oldest among ties.
-        if active.size() >= maxActive
+        // Cap (visible pool): evict the least-advanced candidate, oldest among ties.
+        if not ghost and active.size() >= maxActive
             int ix = 0
             for j = 0 to active.size() - 1
                 if active.get(j).state < active.get(ix).state
                     ix := j
             Seq ev = active.remove(ix)
             f_cancel(ev, "evict")
-        color c = seqColor(d)
-        s.id       := nz(cnt.get("spawned")) + 1
+        s.id       := nz(cnt.get("_id")) + 1
         s.spawnBar := bar_index
-        f_inc("spawned")
-        s.l1    := f_label(b1, "1", d, true)
-        s.l2    := f_label(b2, "2", d, false)
-        s.h1    := f_hline(b1, p1, d)
-        s.h2    := f_hline(b2, p2, d)
-        s.zone  := box.new(b1, top, bar_index, bot, xloc = xloc.bar_index, border_color = color.new(c, ZONE_TR), border_width = 1, bgcolor = color.new(c, ZONE_TR))
-        s.midLn := line.new(b1, s.mid, bar_index, s.mid, xloc = xloc.bar_index, color = color.new(c, MID_TR), style = line.style_dashed, width = 1)
-        if s.state == 1
-            line.set_x2(s.h1, math.min(b1 + BRACKET, s.brk3))
-            s.l3 := f_label(s.b3, "3", d, true)
-            s.h3 := f_hline(s.b3, s.p3, d)
-            s.v3 := line.new(s.brk3, p1, s.brk3, s.p3, xloc = xloc.bar_index, color = c, width = 1)
-        active.push(s)
+        f_inc("_id")
+        if ghost
+            s.tZone  := true
+            s.tagBar := bar_index
+            f_inc("tag.minZoneATR")
+        else
+            color c = seqColor(d)
+            f_inc("spawned")
+            s.l1    := f_label(b1, "1", d, true)
+            s.l2    := f_label(b2, "2", d, false)
+            s.h1    := f_hline(b1, p1, d)
+            s.h2    := f_hline(b2, p2, d)
+            s.zone  := box.new(b1, top, bar_index, bot, xloc = xloc.bar_index, border_color = color.new(c, ZONE_TR), border_width = 1, bgcolor = color.new(c, ZONE_TR))
+            s.midLn := line.new(b1, s.mid, bar_index, s.mid, xloc = xloc.bar_index, color = color.new(c, MID_TR), style = line.style_dashed, width = 1)
+            if s.state == 1
+                line.set_x2(s.h1, math.min(b1 + BRACKET, s.brk3))
+                s.l3 := f_label(s.b3, "3", d, true)
+                s.h3 := f_hline(s.b3, s.p3, d)
+                s.v3 := line.new(s.brk3, p1, s.brk3, s.p3, xloc = xloc.bar_index, color = c, width = 1)
+        pool.push(s)
     s
 
 // Stacking: gather the tap 1–5 labels of one sequence.
@@ -533,20 +682,26 @@ f_collect(Seq s, array<label> L, array<int> B, array<float> P, array<bool> D, ar
             C.push(f_col(s))
     s
 
+// Tap 2 may still move out while waiting for tap 3 (zone expands).
+f_tap2(Seq s) =>
+    if s.state == 0
+        if s.dir == -1 and not na(ePH) and ePH > s.p2 and ePB > s.b2
+            s.p2 := ePH
+            s.b2 := ePB
+            f_setZone(s)
+        else if s.dir == 1 and not na(ePL) and ePL < s.p2 and ePB > s.b2
+            s.p2 := ePL
+            s.b2 := ePB
+            f_setZone(s)
+    s
+
 // ───────────────────────── Engine (confirmed bars only) ─────────────────────────
 if barstate.isconfirmed
-    // Tap 2 may still move out while waiting for tap 3 (zone expands).
-    if active.size() > 0 and (not na(ePH) or not na(ePL))
+    if not na(ePH) or not na(ePL)
         for s in active
-            if s.state == 0
-                if s.dir == -1 and not na(ePH) and ePH > s.p2 and ePB > s.b2
-                    s.p2 := ePH
-                    s.b2 := ePB
-                    f_setZone(s)
-                else if s.dir == 1 and not na(ePL) and ePL < s.p2 and ePB > s.b2
-                    s.p2 := ePL
-                    s.b2 := ePB
-                    f_setZone(s)
+            f_tap2(s)
+        for s in shadow
+            f_tap2(s)
 
     // Spawn: bearish leg = ext low (tap 1) -> ext high (tap 2); bullish is the mirror.
     if not na(ePH) and bias == -1 and not na(lastLoP) and lastLoB < ePB and ePH > lastLoP and lastLoB != nz(lastSpawnBear, -1)
@@ -562,89 +717,99 @@ if barstate.isconfirmed
         lastLoP := ePL
         lastLoB := ePB
 
-    // Step candidates (at most one state advance per bar).
-    for s in active
+    // Step visible and shadow candidates (at most one state advance per bar).
+    // Sequences hidden during this bar are already in the list and are not stepped twice.
+    array<Seq> work = array.concat(active.copy(), shadow.copy())
+    for s in work
         if s.state <= 4
-            int   d   = s.dir
-            color c   = seqColor(d)
-            float piv = d == -1 ? iPH : iPL
-            bool  ok4 = not na(piv) and (d == -1 ? piv < s.mid : piv > s.mid) and (not require4InZone or (d == -1 ? piv > s.p1 : piv < s.p1))
+            int   d    = s.dir
+            color c    = seqColor(d)
+            float piv  = d == -1 ? iPH : iPL
+            bool  ok4  = not na(piv) and (d == -1 ? piv < s.mid : piv > s.mid) and (not require4InZone or (d == -1 ? piv > s.p1 : piv < s.p1))
+            bool  dead = false
+            if s.state == 4 and expMode != "Off" and bar_index - s.armedBar > expiryBars
+                dead := f_filter(s, "expiry", expMode)
 
-            if biasCancel and biasMode == "Auto" and bias != d and bar_index > s.spawnBar
-                f_cancel(s, "bias")
-            else if s.state == 4 and bar_index - s.armedBar > expiryBars
-                f_cancel(s, "expiry")
-            else if s.state == 4 and bar_index > s.armedBar and f_reach(d, s.entryP)
-                f_fill(s)
-            else if d == -1 ? close > s.p2 : close < s.p2
-                f_cancel(s, "close>2")
-            else if (s.state == 1 or s.state == 2) and mitMode != "Off" and bar_index > s.brk3 and (mitMode == "Close" ? (d == -1 ? close > s.mid : close < s.mid) : f_reach(d, s.mid))
-                f_cancel(s, "mid")
-            else if s.state == 0
-                // Tap 3: big BOS / sweep of tap 1.
-                if f_brk(d, s.p1, breakMode3)
-                    s.state := 1
-                    s.brk3  := bar_index
-                    s.b3    := bar_index
-                    s.p3    := f_trendExt(d)
-                    line.set_x2(s.h1, math.min(s.b1 + BRACKET, bar_index))
-                    s.l3 := f_label(s.b3, "3", d, true)
-                    s.h3 := f_hline(s.b3, s.p3, d)
-                    s.v3 := line.new(bar_index, s.p1, bar_index, s.p3, xloc = xloc.bar_index, color = c, width = 1)
-            else if s.state == 1
-                // Tap 3 tracks the extreme until tap 4 forms.
-                float ex = f_trendExt(d)
-                if f_beyond(d, ex, s.p3)
-                    s.p3 := ex
-                    s.b3 := bar_index
-                    label.set_x(s.l3, s.b3)
-                    line.set_xy1(s.h3, s.b3, s.p3)
-                    line.set_xy2(s.h3, s.b3 + BRACKET, s.p3)
-                    line.set_y2(s.v3, s.p3)
-                    dirty.set(0, true)
-                // Tap 4: internal pivot after tap 3, on the near side of mid.
-                if ok4 and iPB > s.b3
-                    s.state := 2
-                    s.p4    := piv
-                    s.b4    := iPB
-                    s.l4    := f_label(s.b4, "4", d, false)
-                    s.h4    := f_hline(s.b4, s.p4, d)
-            else if s.state == 2
-                // A newer qualifying internal pivot replaces tap 4.
-                if ok4 and iPB > s.b4
-                    s.p4 := piv
-                    s.b4 := iPB
-                    label.set_x(s.l4, s.b4)
-                    line.set_xy1(s.h4, s.b4, s.p4)
-                    line.set_xy2(s.h4, s.b4 + BRACKET, s.p4)
-                    dirty.set(0, true)
-                // Tap 5: mini BOS through tap 3 -> starts trailing.
-                if f_brk(d, s.p3, breakMode5)
-                    s.state := 3
-                    s.brk5  := bar_index
-                    s.b5    := bar_index
-                    s.p5    := f_trendExt(d)
-                    line.set_x2(s.h3, math.min(s.b3 + BRACKET, bar_index))
-                    s.l5 := f_label(s.b5, "5", d, true)
-                    s.h5 := f_hline(s.b5, s.p5, d)
-                    s.v5 := line.new(bar_index, s.p3, bar_index, s.p5, xloc = xloc.bar_index, color = c, width = 1)
-            else if s.state == 3
-                // Tap 5 trails the extreme and locks on an opposite internal pivot after it, or a touch of the entry.
-                f_trail5(s)
-                float opp = d == -1 ? iPH : iPL
-                if f_runaway(s)
-                    f_cancel(s, "runaway")
-                else if (not na(opp) and iPB > s.b5) or f_reach(d, f_entry(s))
-                    f_arm(s)
-            else if s.state == 4
-                // Price ran past the locked tap 5: re-trail it and move the target; entry and stop stay.
-                if f_trail5(s)
-                    if f_runaway(s)
-                        f_cancel(s, "runaway")
-                    else
-                        f_target(s)
+            if not dead
+                if biasCancel and biasMode == "Auto" and bias != d and bar_index > s.spawnBar
+                    f_cancel(s, "bias")
+                else if s.state == 4 and bar_index > s.armedBar and f_reach(d, s.entryP)
+                    f_fill(s)
+                else if d == -1 ? close > s.p2 : close < s.p2
+                    f_cancel(s, "close>2")
+                else if (s.state == 1 or s.state == 2) and mitMode != "Off" and bar_index > s.brk3 and (mitMode == "Close" ? (d == -1 ? close > s.mid : close < s.mid) : f_reach(d, s.mid))
+                    f_cancel(s, "mid")
+                else if s.state == 0
+                    // Tap 3: big BOS / sweep of tap 1.
+                    if f_brk(d, s.p1, breakMode3)
+                        s.state := 1
+                        s.brk3  := bar_index
+                        s.b3    := bar_index
+                        s.p3    := f_trendExt(d)
+                        if not s.hidden
+                            line.set_x2(s.h1, math.min(s.b1 + BRACKET, bar_index))
+                            s.l3 := f_label(s.b3, "3", d, true)
+                            s.h3 := f_hline(s.b3, s.p3, d)
+                            s.v3 := line.new(bar_index, s.p1, bar_index, s.p3, xloc = xloc.bar_index, color = c, width = 1)
+                else if s.state == 1
+                    // Tap 3 tracks the extreme until tap 4 forms.
+                    float ex = f_trendExt(d)
+                    if f_beyond(d, ex, s.p3)
+                        s.p3 := ex
+                        s.b3 := bar_index
+                        label.set_x(s.l3, s.b3)
+                        line.set_xy1(s.h3, s.b3, s.p3)
+                        line.set_xy2(s.h3, s.b3 + BRACKET, s.p3)
+                        line.set_y2(s.v3, s.p3)
+                        dirty.set(0, true)
+                    // Tap 4: internal pivot after tap 3, on the near side of mid.
+                    if ok4 and iPB > s.b3
+                        s.state := 2
+                        s.p4    := piv
+                        s.b4    := iPB
+                        if not s.hidden
+                            s.l4 := f_label(s.b4, "4", d, false)
+                            s.h4 := f_hline(s.b4, s.p4, d)
+                else if s.state == 2
+                    // A newer qualifying internal pivot replaces tap 4.
+                    if ok4 and iPB > s.b4
+                        s.p4 := piv
+                        s.b4 := iPB
+                        label.set_x(s.l4, s.b4)
+                        line.set_xy1(s.h4, s.b4, s.p4)
+                        line.set_xy2(s.h4, s.b4 + BRACKET, s.p4)
+                        dirty.set(0, true)
+                    // Tap 5: mini BOS through tap 3 -> starts trailing.
+                    if f_brk(d, s.p3, breakMode5)
+                        s.state := 3
+                        s.brk5  := bar_index
+                        s.b5    := bar_index
+                        s.p5    := f_trendExt(d)
+                        if not s.hidden
+                            line.set_x2(s.h3, math.min(s.b3 + BRACKET, bar_index))
+                            s.l5 := f_label(s.b5, "5", d, true)
+                            s.h5 := f_hline(s.b5, s.p5, d)
+                            s.v5 := line.new(bar_index, s.p3, bar_index, s.p5, xloc = xloc.bar_index, color = c, width = 1)
+                else if s.state == 3
+                    // Tap 5 trails the extreme and locks on an opposite internal pivot after it, or a touch of the entry.
+                    f_trail5(s)
+                    float opp    = d == -1 ? iPH : iPL
+                    bool  killed = false
+                    if runMode != "Off" and f_runaway(s)
+                        killed := f_filter(s, "runaway", runMode)
+                    if not killed and ((not na(opp) and iPB > s.b5) or f_reach(d, f_entry(s)))
+                        f_arm(s)
+                else if s.state == 4
+                    // Price ran past the locked tap 5: re-trail it and move the target; entry and stop stay.
+                    if f_trail5(s)
+                        bool killed = false
+                        if runMode != "Off" and f_runaway(s)
+                            killed := f_filter(s, "runaway", runMode)
+                        if not killed
+                            f_target(s)
 
-            if s.state <= 4
+
+            if s.state <= 4 and not s.hidden
                 box.set_right(s.zone, bar_index)
                 line.set_x2(s.midLn, bar_index)
                 if s.state == 4 and bar_index - s.armedBar >= minArmBars
@@ -663,11 +828,26 @@ if barstate.isconfirmed
             else
                 f_drawTrade(s, bar_index + BRACKET)
 
-    // Drop sequences that left each list.
+    // Drop sequences that left each list; sequences hidden this bar move to the shadow list.
     if active.size() > 0
         for j = active.size() - 1 to 0
-            if active.get(j).state > 4
+            Seq a = active.get(j)
+            if a.state > 4
                 active.remove(j)
+            else if a.hidden
+                active.remove(j)
+                shadow.push(a)
+    if shadow.size() > 0
+        for j = shadow.size() - 1 to 0
+            if shadow.get(j).state > 4
+                shadow.remove(j)
+    // Shadow cap: drop the least-advanced, oldest hidden sequence.
+    while shadow.size() > SHADOW_CAP * maxActive
+        int ix = 0
+        for j = 0 to shadow.size() - 1
+            if shadow.get(j).state < shadow.get(ix).state
+                ix := j
+        shadow.remove(ix)
     if trades.size() > 0
         for j = trades.size() - 1 to 0
             if trades.get(j).state != 5
@@ -758,6 +938,7 @@ if debugMode and barstate.islast
 
     array<string> K = array.new<string>()
     array<string> V = array.new<string>()
+    f_kv(K, V, "Chart view", "shadow = cancelled")
     f_kv(K, V, "Spawned", str.tostring(nz(cnt.get("spawned"))))
     f_kv(K, V, "Armed", str.tostring(nz(cnt.get("armed"))))
     f_kv(K, V, "Filled", str.tostring(nFill))
@@ -785,6 +966,119 @@ if debugMode and barstate.islast
     for [i, k] in K
         table.cell(dbg, 0, i, k, text_color = color.gray, text_size = size.small, text_halign = text.align_left)
         table.cell(dbg, 1, i, V.get(i), text_color = color.gray, text_size = size.small, text_halign = text.align_right)
+
+// ───────────────────────── Filter impact (shadow) ─────────────────────────
+var table imp = na
+
+// Trades in [lo, hi) a filter tagged (removed) vs not (kept): count and expectancy.
+f_split(array<bool> T, int lo, int hi) =>
+    int   nR = 0
+    int   nK = 0
+    float sR = 0.0
+    float sK = 0.0
+    if hi > lo
+        for i = lo to hi - 1
+            if T.get(i)
+                nR += 1
+                sR += trR.get(i)
+            else
+                nK += 1
+                sK += trR.get(i)
+    [nR, nR > 0 ? sR / nR : na, nK > 0 ? sK / nK : na]
+
+f_verdict(int nRem, float rem, float kept) =>
+    na(rem) ? "Need data" : rem < 0 and nRem >= 20 ? "Enforce" : not na(kept) and rem > kept ? "Drop" : "Need data"
+
+// Trades in [lo, hi) whose bucket key equals want: count and expectancy.
+f_bucket(array<int> K, int want, int lo, int hi) =>
+    int   n = 0
+    float t = 0.0
+    if hi > lo
+        for i = lo to hi - 1
+            if want < 0 or K.get(i) == want
+                n += 1
+                t += trR.get(i)
+    [n, n > 0 ? t / n : na]
+
+f_cell(int col, int row, string txt) =>
+    table.cell(imp, col, row, txt, text_color = color.gray, text_size = size.small, text_halign = col == 0 ? text.align_left : text.align_right)
+    row
+
+f_bucketRows(int row0, string title, array<int> K, array<string> names, int N) =>
+    int row = row0
+    f_cell(0, row, title)
+    f_cell(1, row, "n")
+    f_cell(2, row, "exp")
+    row += 1
+    for [k, nm] in names
+        [n, e] = f_bucket(K, k, 0, N)
+        f_cell(0, row, "  " + nm)
+        f_cell(1, row, str.tostring(n))
+        f_cell(2, row, f_r(e))
+        row += 1
+    row
+
+if debugMode and debugBreakdown and barstate.islast
+    if na(imp)
+        imp := table.new(position.bottom_right, 6, 40, bgcolor = color.new(color.gray, 90), frame_width = 0, border_width = 0)
+    int N    = trR.size()
+    int half = int(math.floor(N / 2))
+    int row  = 0
+    for [ci, h] in array.from("Filter (all trades)", "Tagged", "Removes", "Removed exp", "Kept exp", "Verdict · H1 · H2")
+        f_cell(ci, row, h)
+    row += 1
+    for [fi, fname] in array.from("runaway", "expiry", "superseded", "minZoneATR")
+        array<bool> T = fi == 0 ? trRun : fi == 1 ? trExp : fi == 2 ? trSup : trZn
+        string mode   = fi == 0 ? runMode : fi == 1 ? expMode : fi == 2 ? supMode : zoneMode
+        [nR, eR, eK]    = f_split(T, 0, N)
+        [nR1, eR1, eK1] = f_split(T, 0, half)
+        [nR2, eR2, eK2] = f_split(T, half, N)
+        string v  = f_verdict(nR, eR, eK)
+        string v1 = f_verdict(nR1, eR1, eK1)
+        string v2 = f_verdict(nR2, eR2, eK2)
+        f_cell(0, row, fname + " [" + mode + "]")
+        f_cell(1, row, str.tostring(nz(cnt.get("tag." + fname))))
+        f_cell(2, row, str.tostring(nR))
+        f_cell(3, row, f_r(eR))
+        f_cell(4, row, f_r(eK))
+        f_cell(5, row, v + " · " + v1 + " · " + v2 + (v1 != v2 ? " (flips: noise)" : ""))
+        row += 1
+    // Whole sample, the no-tag subset (the Enforce view) and the two halves.
+    int   nClean = 0
+    float sClean = 0.0
+    if N > 0
+        for i = 0 to N - 1
+            if not (trRun.get(i) or trExp.get(i) or trSup.get(i) or trZn.get(i))
+                nClean += 1
+                sClean += trR.get(i)
+    // want = -1 matches every trade (any key array of length N works).
+    [nA, eA]   = f_bucket(trSess, -1, 0, N)
+    [nH1, eH1] = f_bucket(trSess, -1, 0, half)
+    [nH2, eH2] = f_bucket(trSess, -1, half, N)
+    f_cell(0, row, "Sample")
+    f_cell(1, row, "n")
+    f_cell(2, row, "exp")
+    row += 1
+    f_cell(0, row, "  All trades (shadow incl.)")
+    f_cell(1, row, str.tostring(nA))
+    f_cell(2, row, f_r(eA))
+    row += 1
+    f_cell(0, row, "  No shadow tags")
+    f_cell(1, row, str.tostring(nClean))
+    f_cell(2, row, f_r(nClean > 0 ? sClean / nClean : na))
+    row += 1
+    f_cell(0, row, "  First half")
+    f_cell(1, row, str.tostring(nH1))
+    f_cell(2, row, f_r(eH1))
+    row += 1
+    f_cell(0, row, "  Second half")
+    f_cell(1, row, str.tostring(nH2))
+    f_cell(2, row, f_r(eH2))
+    row += 1
+    row := f_bucketRows(row, "Session (fill, ET)", trSess, array.from("NY 09:30–16:00", "London 03:00–09:30", "Asia / other"), N)
+    row := f_bucketRows(row, "Tap 5 ext from mid (zones)", trExt, array.from("<1", "1–2", "2–3", ">3"), N)
+    row := f_bucketRows(row, "Zone height (ATR)", trZh, array.from("<1", "1–2", "2–3", ">3"), N)
+    row := f_bucketRows(row, "Bars arm→fill", trA2F, array.from("≤10", "11–40", ">40"), N)
 
 // ───────────────────────── Alert conditions (UI dropdown) ─────────────────────────
 alertcondition(fl.get(0), "6-Tap armed (short)",  '{"event":"armed","dir":"short","symbol":"{{ticker}}","tf":"{{interval}}","price":{{close}}}')

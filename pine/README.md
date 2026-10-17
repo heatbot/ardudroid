@@ -18,6 +18,27 @@ Cancel reasons: `close>2`, `runaway`, `superseded`, `mid`, `expiry`, `bias`, `ev
 `bias` only applies when "Cancel sequences when bias flips" is on (off by default); bias otherwise just filters which direction new sequences spawn in, using its own longer pivot length (15).
 Turn on **Debug mode** to see the reason next to each dead sequence and a stats table: counts, cancel reasons, and trade magnitude in R (avg win/loss, payoff ratio, profit factor, expectancy vs breakeven win rate, max drawdown, loss streak, MFE on stopped trades, long/short split) plus net points and net $ after `commissionPerSide` × 2 × `contracts`.
 
+## Shadow filters (v2.4)
+The model's own invalidation, a close beyond tap 2, is always enforced. The four
+invented rules (`runaway`, `expiry`, `superseded`, `minZoneATR`) each have a mode:
+
+- **Off**: the rule is not applied.
+- **Shadow** (default): nothing is cancelled. The sequence is tagged, removed from
+  the chart (so the chart shows what Enforce would show), and keeps running hidden
+  until it fills and resolves or dies on `close>2`.
+- **Enforce**: the rule cancels the sequence.
+
+With **Debug mode** and **Filter impact table** on, a second table (bottom right)
+shows, per filter, how many filled trades it would remove, the expectancy of
+removed vs kept trades, a verdict (`Enforce` if removed expectancy < 0 over at
+least 20 trades, `Drop` if removed beats kept, else `Need data`) for the whole
+sample and each half (a flip between halves is noise), and expectancy by
+session, tap 5 extension, zone height and bars from arm to fill.
+
+The top-right table stays the chart (Enforce) view: shadow-hidden sequences count
+as cancelled there and their trades are left out of its magnitude stats.
+Hidden sequences never affect visible ones (cap, dedupe, superseding).
+
 ## Notes
 - The engine only changes state on confirmed bars, and pivots are drawn back on
   their pivot bar after confirmation, so drawings do not repaint.
