@@ -1,5 +1,5 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// 6-Tap v2.8 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
+// 6-Tap v2.9 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
 // Bearish model shown in comments; bullish is the exact mirror.
 //   Tap 1  external swing low (liquidity)      Tap 2  external swing high (protected)
 //   Zone   tap 1 .. tap 2, mid = 50%           Tap 3  big BOS / sweep of tap 1
@@ -48,11 +48,12 @@ int    targetExtTicks = input.int(0, "Target extension (ticks)", minval = 0, gro
 float  fixedR         = input.float(2.0, "Fixed R", minval = 0.1, step = 0.1, group = G_TRD)
 float  stopBufferATR  = input.float(0.1, "Stop buffer (× ATR 14)", minval = 0, step = 0.05, group = G_TRD)
 
-string sweepLevel     = input.string("Zone edge", "Sweep must reach", options = ["Zone edge", "50%", "Tap 4 only"], group = G_CONF, tooltip = "Zone edge = tap 1")
+string sweepLevel     = input.string("Zone edge", "Sweep must reach", options = ["Zone edge", "50%", "Tap 4 only", "FVG"], group = G_CONF, tooltip = "Zone edge = tap 1. FVG: after taking tap 4, price must trade into the zone's fair value gap (no valid FVG = no trade).")
 int    confLen        = input.int(1, "Confirmation fractal length", minval = 1, group = G_CONF, tooltip = "1 = 3-bar fractal")
 string confBreak      = input.string("Close", "Confirmation entry", options = ["Close", "Stop order"], group = G_CONF, tooltip = "Close: enter at the close beyond the level (strategy: market at the next open). Stop order: 1 tick beyond the level.")
 int    confExpiryBars = input.int(30, "Bars after the sweep to confirm", minval = 1, group = G_CONF)
 int    minRiskTicks   = input.int(8, "Min risk (ticks)", minval = 0, group = G_CONF)
+int    minFvgTicks    = input.int(4, "Min FVG size (ticks)", minval = 1, group = G_CONF, tooltip = "Fair value gap left inside the zone by the displacement leg that broke tap 1")
 
 string trailMode      = input.string("One behind", "Trail stop", options = ["One behind", "Latest", "Off"], group = G_TRL, tooltip = "After a mini break of structure in the trade direction, move the stop beyond the second-latest (one behind) or latest post-entry swing")
 int    trailLen       = input.int(1, "Trail pivot length", minval = 1, group = G_TRL)
@@ -66,6 +67,7 @@ color  bullColor       = input.color(#26A69A, "Bullish color", group = G_DSP)
 color  bearColor       = input.color(#E5534B, "Bearish color", group = G_DSP)
 string labelSize       = input.string("small", "Label size", options = ["tiny", "small", "normal", "large"], group = G_DSP)
 bool   showLiquidityLines = input.bool(true, "Liquidity lines (taps 2, 4, 5, confirmation level)", group = G_DSP)
+bool   showFVG         = input.bool(true, "FVG inside the zone (gray band)", group = G_DSP)
 // ==== SHARED INPUTS END ====
 
 float  minRR          = input.float(1.5, "Min planned R:R (below = optional)", minval = 0, step = 0.1, group = G_TRD)
@@ -82,6 +84,7 @@ float  maxZoneATR  = input.float(3.0, "Max zone size (× ATR 14)", minval = 0.1,
 string extMinMode  = input.string("Shadow", "minTap5Ext (min tap 5 extension at arming)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
 float  minTap5Ext  = input.float(2.0, "Min tap 5 extension (× zone height from mid)", minval = 0, step = 0.1, group = G_FLT)
 string sessMode    = input.string("Shadow", "session (skip fills NY 09:30–16:00 ET)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = FLT_TIP)
+string fvgMode     = input.string("Off", "requireFVG (fill only after the FVG was touched)", options = ["Off", "Shadow", "Enforce"], group = G_FLT, tooltip = "Off by default: the impact table measures requireFVG from the FVG tags in every mode. Shadow would already hide untouched trades from the chart.")
 
 string dailyMode      = input.string("Shadow", "Daily loss limit", options = ["Off", "Shadow", "Enforce"], group = G_DAY, tooltip = "Day starts 18:00 ET; only non-optional trades count. Shadow: no limit vs 2 / 3 losses in the exits table. Enforce: after the limit, new setups that day are drawn as optional (limit).")
 int    dailyMaxLosses = input.int(3, "Max losses per day", minval = 1, group = G_DAY)
@@ -103,7 +106,7 @@ string tableTextSize   = input.string("tiny", "Table text size", options = ["tin
 const bool DRAW = true   // the strategy turns drawings off for faster deep backtests
 
 // Mode per shadow filter, in F_* order ("flag" for the rr pseudo-filter).
-array<string> FMODES = array.from(runMode, expMode, supMode, zoneMode, maxZoneMode, extMinMode, sessMode, "flag")
+array<string> FMODES = array.from(runMode, expMode, supMode, zoneMode, maxZoneMode, extMinMode, sessMode, fvgMode, "flag")
 
 // Table corners: a table that asks for a taken corner moves to the next free one.
 f_free(string p, string u1, string u2, string u3) =>
@@ -126,7 +129,7 @@ string tblSize   = tableTextSize == "small" ? size.small : tableTextSize == "nor
 
 // ==== ENGINE BEGIN ====
 // Shared verbatim with "6-Tap Strategy": edit it here, then run pine/build_strategy.py.
-const string ENGINE_VERSION = "2.8"
+const string ENGINE_VERSION = "2.9"
 
 const int BRACKET = 8    // bars a tap bracket extends to the right
 const int ZONE_TR = 88   // zone fill transparency
@@ -134,6 +137,7 @@ const int FADE_ZT = 95   // faded zone fill transparency
 const int FADE_TR = 60   // faded labels / lines transparency
 const int MID_TR  = 30   // 50% line transparency
 const int LIQ_TR  = 30   // liquidity line transparency
+const color FVG_COL = #787B86
 const int SHADOW_CAP = 5 // hidden sequences kept: SHADOW_CAP × maxActive
 const int MAX_BACK   = 9000  // drawings can't be placed ~10,000+ bars back with xloc.bar_index
 const int TRK_CAP    = 800   // entry trackers kept (pending or with exit variants still open)
@@ -148,8 +152,10 @@ const int F_MINZ   = 3
 const int F_MAXZ   = 4
 const int F_EXTMIN = 5
 const int F_SESS   = 6
-const int NF       = 7
-var array<string> FNAMES = array.from("runaway", "expiry", "superseded", "minZoneATR", "maxZoneATR", "minTap5Ext", "session", "rr")
+const int F_FVG    = 7
+const int NF       = 8
+var array<string> FNAMES = array.from("runaway", "expiry", "superseded", "minZoneATR", "maxZoneATR", "minTap5Ext", "session", "requireFVG", "rr")
+var array<string> FVGTAGS = array.from("nofvg", "fvg", "fvg_touched", "fvg_mitigated")
 var array<string> MNAMES = array.from("50% limit", "Tap 4 sweep", "Confirmation")
 
 // Entry mode that drives the chart, alerts and the strategy's orders.
@@ -251,6 +257,12 @@ type Seq
     bool   lq4On = false
     bool   lq5On = false
     array<line> oldStops    // faded segments left where the trailed stop used to be
+    float  fvgTop           // FVG inside the zone, left by the leg that broke tap 1 (na = none)
+    float  fvgBot
+    int    fvgBar
+    bool   fvgMit = false   // chart view: closed through before the sweep / fill
+    string fvgTag = "nofvg" // chart trade's tag: nofvg, fvg, fvg_touched, fvg_mitigated
+    box    fvgBox
 
 // One armed sequence under one entry mode. All three modes run in parallel for the
 // entry-variants table and the log; the one matching entryMode drives the chart.
@@ -288,6 +300,9 @@ type Trk
     array<float> xrem
     array<float> xbank
     int    xopen = 0
+    bool   fvgT = false     // the FVG was touched (limit modes: before the fill; confirmation: by the sweep)
+    bool   fvgMit = false   // the FVG was closed through first
+    string fvgTag = "nofvg"
 
 // ───────────────────────── Structure & bias ─────────────────────────
 // Bias from external structure: close above last swing high -> bull, below last swing low -> bear.
@@ -347,6 +362,7 @@ var array<int>   trSess = array.new<int>()
 var array<int>   trExt  = array.new<int>()   // tap 5 extension from mid: 0 <1, 1 1–2, 2 2–3, 3 >3 zone heights
 var array<int>   trZh   = array.new<int>()   // zone height in ATR, same buckets
 var array<int>   trA2F  = array.new<int>()   // bars arm -> fill: 0 ≤10, 1 11–40, 2 >40
+var array<int>   trFvg  = array.new<int>()   // FVG tag index in FVGTAGS
 
 // Chart (visible) trades only.
 var array<float> visR    = array.new<float>()   // R per trade
@@ -479,6 +495,12 @@ f_alert(string ev, Seq s, string reason) =>
         alert(msg, alert.freq_once_per_bar_close)
     s
 
+// Freeze or extend the zone box and its FVG box.
+f_zoneRight(Seq s, int x) =>
+    box.set_right(s.zone, x)
+    box.set_right(s.fvgBox, x)
+    s
+
 // Recalculate mid and move the zone drawings after tap 2 changes.
 f_setZone(Seq s) =>
     s.mid := (s.p1 + s.p2) / 2
@@ -567,6 +589,7 @@ method delAll(Seq s) =>
     line.delete(s.lq4)
     line.delete(s.lq5)
     line.delete(s.lqC)
+    box.delete(s.fvgBox)
     if not na(s.oldStops)
         for ln in s.oldStops
             line.delete(ln)
@@ -602,6 +625,7 @@ f_fade(Seq s) =>
     s.lq5On := false
     box.set_bgcolor(s.zone, cz)
     box.set_border_color(s.zone, cz)
+    box.set_bgcolor(s.fvgBox, color.new(FVG_COL, 94))
     dirty.set(0, true)
     s
 
@@ -637,7 +661,7 @@ f_cancel(Seq s, string reason) =>
         s.state  := 6
         s.result := reason
         f_delTrade(s)
-        box.set_right(s.zone, bar_index)
+        f_zoneRight(s, bar_index)
         line.set_x2(s.midLn, bar_index)
         if keep
             f_fade(s)
@@ -679,6 +703,7 @@ f_nullDraw(Seq s) =>
     s.lq5   := na
     s.lqC   := na
     s.oldStops := na
+    s.fvgBox := na
     s
 
 // Shadow tag on a visible sequence: the chart shows the Enforce view (a faded,
@@ -693,7 +718,7 @@ f_hide(Seq s, string reason) =>
         f_alert("cancelled", s, reason)
         fl.set(4, true)
     f_delTrade(v)
-    box.set_right(v.zone, bar_index)
+    f_zoneRight(v, bar_index)
     line.set_x2(v.midLn, bar_index)
     if keepCancelled
         f_fade(v)
@@ -843,7 +868,8 @@ f_csv(Trk t) =>
     string ln = str.tostring(s.id) + "," + MNAMES.get(t.mode) + "," + (s.dir == 1 ? "long" : "short") + "," + f_t(s.tSpawn) + "," + f_t(s.tArm) + "," + f_t(t.tFill) + "," + f_t(t.tExit)
     ln += "," + f_num(t.entryP) + "," + f_num(t.stopP) + "," + f_num(t.tgtP) + "," + f_num(t.risk0) + "," + str.tostring(t.rr, "0.00")
     ln += "," + str.tostring(s.zoneATR, "0.00") + "," + str.tostring(zh > 0 ? math.abs(t.p5 - s.mid) / zh : na, "0.00") + "," + str.tostring(t.bFill - s.armedBar)
-    ln += "," + (t.sess == 0 ? "NY" : t.sess == 1 ? "London" : "Asia") + "," + tags + "," + f_num(t.peak) + "," + f_num(t.cl) + res
+    ln += "," + (t.sess == 0 ? "NY" : t.sess == 1 ? "London" : "Asia") + "," + tags + "," + f_num(t.peak) + "," + f_num(t.cl)
+    ln += "," + f_num(s.fvgTop) + "," + f_num(s.fvgBot) + "," + t.fvgTag + res
     ln += "," + str.tostring(t.risk0 > 0 ? t.mfe / t.risk0 : na, "0.000") + "," + str.tostring(t.risk0 > 0 ? t.mae / t.risk0 : na, "0.000")
     log.info(ln)
     t
@@ -915,6 +941,44 @@ f_xstep(Trk t) =>
                 t.xs.set(v, cand)
     t
 
+// ───────────────────────── FVG inside the zone (v3.3) ─────────────────────────
+// At the tap 3 break: scan every 3-candle window between the tap 2 bar and the break for a
+// gap in the leg's direction (bearish: low two bars back above this bar's high), clip it to
+// the zone, keep it if at least minFvgTicks tall, and pick the one closest to mid (ties: earlier).
+f_fvgFind(Seq s) =>
+    int   d    = s.dir
+    float top  = math.max(s.p1, s.p2)
+    float bot  = math.min(s.p1, s.p2)
+    int   oNew = bar_index - s.brk3
+    int   oOld = math.min(bar_index - s.b2 - 2, oNew + 300)
+    float best = na
+    if oOld >= oNew
+        for o = oNew to oOld
+            float gTop = d == -1 ? low[o + 2] : low[o]
+            float gBot = d == -1 ? high[o] : high[o + 2]
+            if gTop > gBot
+                float ct = math.min(gTop, top)
+                float cb = math.max(gBot, bot)
+                if ct - cb >= minFvgTicks * syminfo.mintick
+                    float dist = math.abs((ct + cb) / 2 - s.mid)
+                    if na(best) or dist <= best
+                        best     := dist
+                        s.fvgTop := ct
+                        s.fvgBot := cb
+                        s.fvgBar := bar_index - o - 2
+    s
+
+f_fvgDraw(Seq s) =>
+    if DRAW and showFVG and not s.hidden and not na(s.fvgTop)
+        s.fvgBox := box.new(f_xc(s.fvgBar), s.fvgTop, bar_index, s.fvgBot, xloc = xloc.bar_index, border_color = color.new(FVG_COL, 100), border_width = 0, bgcolor = color.new(FVG_COL, 85))
+    s
+
+// FVG tag of a tracker at its fill.
+f_fvgTagOf(Trk t) => na(t.s.fvgTop) ? 0 : t.fvgT ? 2 : t.fvgMit ? 3 : 1
+
+// Reasons that belong to one entry mode and do not end the other modes' trackers.
+f_ownReason(string r) => r == "close>2" or r == "noconf" or r == "tinyR" or r == "session" or r == "requireFVG" or r == "nofvg" or r == "fvgmit"
+
 // ───────────────────────── Chart trade ─────────────────────────
 // Trade result. Visible trades feed the chart stats; every trade (visible or shadow) is
 // recorded for the filter impact table. With a trailed stop a "stop" can be a winner.
@@ -938,6 +1002,7 @@ f_finish(Seq s, string res) =>
     trZh.push(f_bucket4(s.zoneATR))
     int a2f = s.b6 - s.armedBar
     trA2F.push(a2f <= 10 ? 0 : a2f <= 40 ? 1 : 2)
+    trFvg.push(math.max(0, FVGTAGS.indexof(s.fvgTag)))
     if not s.hidden
         f_inc(res)
         visR.push(r)
@@ -996,6 +1061,7 @@ f_fill(Seq s, Trk t) =>
     s.state  := 5
     s.b6     := bar_index
     s.sess   := t.sess
+    s.fvgTag := t.fvgTag
     if CHART_MODE == 2
         s.rr    := t.rr
         s.optRR := not na(s.rr) and (s.rr < minRR or (maxRR > 0 and s.rr > maxRR))
@@ -1009,7 +1075,7 @@ f_fill(Seq s, Trk t) =>
             if CHART_MODE < 2
                 s.l6 := label.new(bar_index, s.entryP, "6", xloc = xloc.bar_index, color = color.new(c, 100), style = s.dir == -1 ? label.style_label_down : label.style_label_up, textcolor = c, size = lblSize)
             s.lDot := label.new(bar_index, s.entryP, "", xloc = xloc.bar_index, color = c, style = label.style_circle, size = size.tiny)
-        box.set_right(s.zone, bar_index)
+        f_zoneRight(s, bar_index)
         line.set_x2(s.midLn, bar_index)
         line.set_x2(s.h4, f_xc(math.min(s.b4 + BRACKET, bar_index)))
         line.set_x2(s.lqC, bar_index)
@@ -1092,6 +1158,14 @@ f_tfill(Trk t, float e, float st, bool touchBar) =>
             ok := false
         if not ok
             f_tend(t, "session")
+    t.fvgTag := FVGTAGS.get(f_fvgTagOf(t))
+    if ok and fvgMode != "Off" and t.fvgTag != "fvg_touched"
+        if t.chart
+            ok := not f_filter(s, F_FVG)
+        else if fvgMode == "Enforce"
+            ok := false
+        if not ok
+            f_tend(t, "requireFVG")
     if ok
         t.entryP := e
         t.stopP  := st
@@ -1171,9 +1245,20 @@ f_tstep(Trk t) =>
             f_xstep(t)
     else if t.st < 2 and bar_index > s.armedBar
         // An enforced cancel of the sequence before its chart fill ends every mode. Reasons
-        // every tracker checks for itself (close>2) or that belong to the chart mode
-        // (noconf, tinyR, session) do not carry over.
-        bool seqDead = s.state == 6 and na(s.b6) and s.result != "close>2" and s.result != "noconf" and s.result != "tinyR" and s.result != "session"
+        // every tracker checks for itself or that belong to the chart mode (f_ownReason) do not.
+        bool seqDead = s.state == 6 and na(s.b6) and not f_ownReason(s.result)
+        // FVG: touched (limit modes: any bar before the fill; confirmation: by the sweep) or
+        // closed through first (used up).
+        bool  hasF  = not na(s.fvgTop)
+        bool  inF   = hasF and (d == -1 ? high >= s.fvgBot : low <= s.fvgTop)
+        bool  thru4 = d == -1 ? high > s.p4 : low < s.p4
+        float lvl   = sweepLevel == "Zone edge" ? s.p1 : sweepLevel == "50%" ? s.mid : sweepLevel == "FVG" ? (d == -1 ? s.fvgBot : s.fvgTop) : s.p4
+        bool  swNow = t.mode == 2 and t.st == 0 and thru4 and (sweepLevel == "FVG" ? inF and not t.fvgMit : f_reach(d, lvl))
+        if hasF and not t.fvgT and not t.fvgMit
+            if inF and (t.mode < 2 or t.st == 1 or swNow)
+                t.fvgT := true
+            else if d == -1 ? close > s.fvgTop : close < s.fvgBot
+                t.fvgMit := true
         if seqDead
             f_tend(t, s.result)
         else if t.mode < 2 and f_reach(d, f_limitLevel(s, t.mode))
@@ -1185,9 +1270,9 @@ f_tstep(Trk t) =>
             if f_beyond(d, f_trendExt(d), t.p5)
                 t.p5 := f_trendExt(d)
         else if t.st == 0
-            bool  thru4 = d == -1 ? high > s.p4 : low < s.p4
-            float lvl   = sweepLevel == "Zone edge" ? s.p1 : sweepLevel == "50%" ? s.mid : s.p4
-            if thru4 and f_reach(d, lvl)
+            if sweepLevel == "FVG" and (not hasF or t.fvgMit)
+                f_tend(t, hasF ? "fvgmit" : "nofvg")
+            else if swNow
                 t.st       := 1
                 t.sweepBar := bar_index
                 t.peak     := f_cExt(d)
@@ -1292,6 +1377,8 @@ f_spawn(int d, int b1, float p1, int b2, float p2) =>
         s.spawnBar := bar_index
         s.tSpawn   := time
         f_inc("_id")
+        if s.state == 1
+            f_fvgFind(s)
         if ghost
             s.tagBar := bar_index
             if small and zoneMode == "Shadow"
@@ -1317,6 +1404,7 @@ f_spawn(int d, int b1, float p1, int b2, float p2) =>
                 s.l3 := f_label(s.b3, "3", d, true)
                 s.h3 := f_hline(s.b3, s.p3, d)
                 s.v3 := f_vline(s.brk3, p1, s.p3, c)
+                f_fvgDraw(s)
         pool.push(s)
     s
 
@@ -1417,11 +1505,13 @@ if barstate.isconfirmed
                         s.brk3  := bar_index
                         s.b3    := bar_index
                         s.p3    := f_trendExt(d)
+                        f_fvgFind(s)
                         if not s.hidden
                             line.set_x2(s.h1, f_xc(math.min(s.b1 + BRACKET, bar_index)))
                             s.l3 := f_label(s.b3, "3", d, true)
                             s.h3 := f_hline(s.b3, s.p3, d)
                             s.v3 := f_vline(bar_index, s.p1, s.p3, c)
+                            f_fvgDraw(s)
                 else if s.state == 1
                     // Tap 3 tracks the extreme until tap 4 forms.
                     float ex = f_trendExt(d)
@@ -1487,9 +1577,13 @@ if barstate.isconfirmed
 
 
             if s.state <= 4 and not s.hidden
-                box.set_right(s.zone, bar_index)
+                f_zoneRight(s, bar_index)
                 line.set_x2(s.midLn, bar_index)
                 f_liqStep(s)
+                // Chart view: an FVG closed through before the sweep (or fill) is used up.
+                if not na(s.fvgTop) and not s.fvgMit and na(s.sweepBar) and s.state >= 1 and (d == -1 ? close > s.fvgTop : close < s.fvgBot)
+                    s.fvgMit := true
+                    box.set_bgcolor(s.fvgBox, color.new(FVG_COL, 95))
                 if s.state == 4 and bar_index - s.armedBar >= minArmBars
                     if f_armRank(s) < maxArmedPerDir
                         f_drawTrade(s, bar_index + BRACKET)
@@ -1709,7 +1803,7 @@ if debugMode and barstate.islast
     f_kv(K, V, "  Open", str.tostring(nFill - nTgt - nStop))
     f_kv(K, V, "Max concurrent open trades", str.tostring(nz(fs.get("maxOpen")), "0"))
     f_kv(K, V, "Cancelled", str.tostring(nz(cnt.get("cancelled"))))
-    for rs in array.from("evict", "bias", "mid", "close>2", "runaway", "superseded", "expiry", "minTap5Ext", "session")
+    for rs in array.from("evict", "bias", "mid", "close>2", "runaway", "superseded", "expiry", "minTap5Ext", "session", "noconf", "tinyR", "requireFVG", "nofvg", "fvgmit")
         f_kv(K, V, "  " + rs, str.tostring(nz(cnt.get(rs))))
     f_kv(K, V, "Target hits", str.tostring(nTgt))
     f_kv(K, V, "Stop hits", str.tostring(nStop))
@@ -1736,6 +1830,7 @@ if debugMode and barstate.islast
 
 // ── Filter impact (all trades, shadow included) ──
 // Trades in [lo, hi) tagged by filter bit fi (removed) vs not (kept): count and expectancy.
+// requireFVG is measured from the FVG tags in every mode: it removes trades whose FVG was not touched.
 f_split(int fi, int lo, int hi) =>
     int   nR = 0
     int   nK = 0
@@ -1743,7 +1838,7 @@ f_split(int fi, int lo, int hi) =>
     float sK = 0.0
     if hi > lo
         for i = lo to hi - 1
-            if f_has(trMask.get(i), fi)
+            if fi == F_FVG ? trFvg.get(i) != 2 : f_has(trMask.get(i), fi)
                 nR += 1
                 sR += trR.get(i)
             else
@@ -1787,7 +1882,7 @@ if debugMode and debugBreakdown and barstate.islast
         string v1 = f_verdict(nR1, eR1, eK1)
         string v2 = f_verdict(nR2, eR2, eK2)
         f_cell(imp, 0, row, fname + " [" + FMODES.get(fi) + "]")
-        f_cell(imp, 1, row, str.tostring(nz(cnt.get("tag." + fname))))
+        f_cell(imp, 1, row, fi == F_FVG ? "from tags" : str.tostring(nz(cnt.get("tag." + fname))))
         f_cell(imp, 2, row, str.tostring(nR))
         f_cell(imp, 3, row, f_r(eR))
         f_cell(imp, 4, row, f_r(eK))
@@ -1809,6 +1904,7 @@ if debugMode and debugBreakdown and barstate.islast
     row := f_bucketRows(imp, row, "Zone height (ATR)", trZh, array.from("<1", "1–2", "2–3", ">3"), N)
     row := f_bucketRows(imp, row, "Bars arm→fill", trA2F, array.from("≤10", "11–40", ">40"), N)
     row := f_bucketRows(imp, row, "Planned R:R", trRRb, array.from("<1.5", "1.5–2", "2–3", "3–5", ">5"), N)
+    row := f_bucketRows(imp, row, "FVG", trFvg, array.from("no FVG", "FVG, not touched", "FVG touched", "FVG mitigated first"), N)
 
 // ── Exit variants, daily limits and excursions (chart trades) ──
 // Share of X at or above th (atLeast) or at or below th.
@@ -1920,7 +2016,7 @@ if debugMode and debugEntries and barstate.islast
 
 // ───────────────────────── Trade log header ─────────────────────────
 if debugLog and barstate.isfirst
-    log.info("id,entry_mode,dir,spawn_time,arm_time,fill_time,exit_time,entry,stop,target,risk_pts,planned_rr,zone_h_atr,tap5_ext_zones,bars_arm_fill,session,tags,sweep_peak,conf_level,result_A,result_B,result_C,result_D,result_E,result_F,result_G,result_H,result_I,result_J,result_K,result_L,mfe_r,mae_r")
+    log.info("id,entry_mode,dir,spawn_time,arm_time,fill_time,exit_time,entry,stop,target,risk_pts,planned_rr,zone_h_atr,tap5_ext_zones,bars_arm_fill,session,tags,sweep_peak,conf_level,fvg_top,fvg_bot,fvg_tag,result_A,result_B,result_C,result_D,result_E,result_F,result_G,result_H,result_I,result_J,result_K,result_L,mfe_r,mae_r")
 
 // ───────────────────────── Alert conditions (UI dropdown) ─────────────────────────
 alertcondition(fl.get(0), "6-Tap armed (short)",  '{"event":"armed","dir":"short","symbol":"{{ticker}}","tf":"{{interval}}","price":{{close}}}')

@@ -64,21 +64,24 @@ f_cancelAll(Seq s) =>
     s
 
 // The bar an order decision is made: limit modes at arming, confirmation (close) at the
-// confirmation, confirmation (stop order) when the sweep starts.
+// confirmation, confirmation (stop order) when the sweep starts. A setup that places no order
+// is counted and, with debugOrders, logged with the first rule that blocked it.
 f_consider(Seq s) =>
     bool evBar = CHART_MODE < 2 ? (s.state == 4 and s.armedBar == bar_index) : confBreak == "Close" ? (not na(s.b6) and s.b6 == bar_index) : (s.state == 4 and s.sweepBar == bar_index)
     if evBar and not s.hidden and not s.sOrdered
-        bool ok = time >= startDate and time <= endDate and not s.opt and ordered.size() < maxConcurrent
-        ok := ok and (dailyMaxLosses == 0 or sday.get(1) < dailyMaxLosses)
-        if ok and not allowOpposite
+        bool opposite = false
+        if not allowOpposite
             for o in ordered
                 if o.dir != s.dir and o.sFilled
-                    ok := false
-        if ok
+                    opposite := true
+        string why = time < startDate or time > endDate ? "window" : s.opt ? "minRR" : dailyMaxLosses > 0 and sday.get(1) >= dailyMaxLosses ? "daily" : ordered.size() >= maxConcurrent ? "cap" : opposite ? "opposite" : CHART_MODE == 2 and confBreak == "Close" and not f_sessOK() ? "session" : ""
+        if why == ""
             s.sOrdered := true
             ordered.push(s)
         else
             sc.set(0, sc.get(0) + 1)
+            if debugOrders
+                log.info("no order " + f_sid(s) + " " + (s.dir == 1 ? "long" : "short") + " " + f_t(time) + ": " + why)
     s
 
 // The engine filled (a touch the emulator did not fill) or cancelled a still-pending order.
@@ -146,7 +149,7 @@ if barstate.isconfirmed
                     f_drop(s, engFill)
             else if confBreak == "Close"
                 // Confirmation close: market order now, filled at the next open.
-                if engFill and s.b6 == bar_index and f_sessOK()
+                if engFill and s.b6 == bar_index
                     strategy.entry(id, s.dir == 1 ? strategy.long : strategy.short, qty = contracts)
                     f_exits(s, s.entryP, s.stopP, risk, false)
                 else

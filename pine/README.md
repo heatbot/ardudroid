@@ -2,8 +2,8 @@
 
 | File | What it is |
 |---|---|
-| `6-tap.pine` | Indicator (v2.8): live charting, alerts, shadow research, trade log |
-| `6-tap-strategy.pine` | Strategy (v3.2): same engine with real orders, for Deep Backtesting. **Generated** — do not edit |
+| `6-tap.pine` | Indicator (v2.9): live charting, alerts, shadow research, trade log |
+| `6-tap-strategy.pine` | Strategy (v3.3): same engine with real orders, for Deep Backtesting. **Generated** — do not edit |
 | `strategy/head.pine`, `strategy/tail.pine` | Strategy-only parts (header + inputs, orders + R table) |
 | `build_strategy.py` | Builds the strategy from the indicator's shared inputs and engine blocks |
 
@@ -103,12 +103,25 @@ Liquidity lines extend from taps 2, 4 and 5 until price trades through them or t
 ends; a gray dashed line marks the confirmation level up to the entry bar
 (`showLiquidityLines`).
 
+## FVG inside the zone (v3.3)
+At the tap 3 break the engine scans every 3-candle window between the tap 2 bar and the break
+for a fair value gap in the leg's direction (bearish: the low two bars back above the bar's
+high), clips it to the zone, ignores gaps under `minFvgTicks`, and keeps the one closest to the
+50% line (ties: the earlier). It is drawn as a gray band (`showFVG`) and used up if a bar closes
+through it before the sweep (limit modes: before the fill).
+
+Each trade is tagged `nofvg`, `fvg`, `fvg_touched` (limit modes: price reached it before the
+fill; confirmation: the sweep reached it) or `fvg_mitigated`. The impact table's `requireFVG`
+row and FVG buckets come from these tags in every mode, so `requireFVG` stays **Off** by
+default (Shadow would already hide untouched trades from the chart). `sweepLevel = FVG` makes
+the confirmation sweep wait for price to trade into the FVG (no valid FVG: `nofvg` / `fvgmit`).
+
 ## Trade log (v2.6)
 Turn on **Trade log** (Debug group) and open the Pine Logs pane. The header prints on the
 first bar; each filled trade (chart and shadow) prints one CSV line once all exit
 variants have resolved:
 
-`id,entry_mode,dir,spawn_time,arm_time,fill_time,exit_time,entry,stop,target,risk_pts,planned_rr,zone_h_atr,tap5_ext_zones,bars_arm_fill,session,tags,sweep_peak,conf_level,result_A,…,result_L,mfe_r,mae_r`
+`id,entry_mode,dir,spawn_time,arm_time,fill_time,exit_time,entry,stop,target,risk_pts,planned_rr,zone_h_atr,tap5_ext_zones,bars_arm_fill,session,tags,sweep_peak,conf_level,fvg_top,fvg_bot,fvg_tag,result_A,…,result_L,mfe_r,mae_r`
 
 One line per entry mode per filled trade (v3.1).
 
@@ -126,7 +139,12 @@ G uses two 50% exits and needs 2+ contracts). Limit fills need price to trade 1 
 strategy does not is reported as a **missed fill**. Orders are only working in the chosen
 sessions. `maxConcurrent` (1–3) caps open + pending positions; with `allowOpposite` off,
 opposite-direction arms place no order while a position is open, and pending opposite
-orders are pulled when one fills. The R table reports trades, win rate, avg win/loss,
+orders are pulled when one fills. The header sets `margin_long = 0, margin_short = 0`: Pine v6 defaults to 100% margin, and one
+MNQ contract's notional is far above the initial capital, so every order was rejected (zero
+trades). With **Log skipped orders** on, each armed setup that places no order is written to
+Pine Logs with the rule that blocked it (`window`, `minRR`, `daily`, `cap`, `opposite`,
+`session`). `requireFVG` (off) only fills trades whose FVG was touched.
+The R table reports trades, win rate, avg win/loss,
 expectancy, expectancy ex top 5, median R, profit factor, max drawdown, max loss streak,
 best month's share of net profit, missed fills, and the pass bar
 (≥150 trades, ≥ +0.15R, PF ≥ 1.3, no month > 30% of net).
