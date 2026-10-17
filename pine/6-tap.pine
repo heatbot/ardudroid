@@ -84,6 +84,7 @@ const int FADE_ZT = 95   // faded zone fill transparency
 const int FADE_TR = 60   // faded labels / lines transparency
 const int MID_TR  = 30   // 50% line transparency
 const int SHADOW_CAP = 5 // hidden sequences kept: SHADOW_CAP × maxActive
+const int MAX_BACK   = 9000  // drawings can't be placed ~10,000+ bars back with xloc.bar_index
 const int EXIT_CAP   = 300   // trades whose exit variants are still being resolved
 const int NV         = 7     // exit variants A–G
 
@@ -277,13 +278,16 @@ f_beyond(int d, float a, float b) => d == -1 ? a < b : a > b
 // Price reaches a level from the far side (the 50% line, the entry).
 f_reach(int d, float lvl) => d == -1 ? high >= lvl : low <= lvl
 
+// Clamp an x coordinate that may point far into the past (e.g. an order armed long ago).
+f_xc(int x) => math.max(x, bar_index - MAX_BACK)
+
 // Tap label: lows below the bar, highs above.
 f_label(int b, string txt, int d, bool trendSide) =>
     dirty.set(0, true)
-    label.new(b, d == -1 ? low : high, txt, xloc = xloc.bar_index, yloc = (d == -1) == trendSide ? yloc.belowbar : yloc.abovebar, color = color.new(seqColor(d), 100), style = label.style_none, textcolor = seqColor(d), size = lblSize)
+    label.new(f_xc(b), d == -1 ? low : high, txt, xloc = xloc.bar_index, yloc = (d == -1) == trendSide ? yloc.belowbar : yloc.abovebar, color = color.new(seqColor(d), 100), style = label.style_none, textcolor = seqColor(d), size = lblSize)
 
 f_hline(int b, float p, int d) =>
-    line.new(b, p, b + BRACKET, p, xloc = xloc.bar_index, color = seqColor(d), style = line.style_solid, width = 1)
+    line.new(f_xc(b), p, f_xc(b + BRACKET), p, xloc = xloc.bar_index, color = seqColor(d), style = line.style_solid, width = 1)
 
 f_num(float x) => na(x) ? "null" : str.tostring(math.round_to_mintick(x))
 
@@ -345,10 +349,10 @@ f_tradeLine(line ln, label lb, int x1, int x2, float p, string txt, string sfx, 
     label lb2 = lb
     string t  = txt + " " + str.tostring(p, format.mintick) + sfx
     if na(l)
-        l   := line.new(x1, p, x2, p, xloc = xloc.bar_index, color = c, style = sty, width = 1)
+        l   := line.new(f_xc(x1), p, x2, p, xloc = xloc.bar_index, color = c, style = sty, width = 1)
         lb2 := label.new(x2, p, t, xloc = xloc.bar_index, color = color.new(c, 100), style = label.style_label_left, textcolor = c, size = size.tiny)
     else
-        line.set_xy1(l, x1, p)
+        line.set_xy1(l, f_xc(x1), p)
         line.set_xy2(l, x2, p)
         line.set_color(l, c)
         line.set_style(l, sty)
@@ -473,7 +477,7 @@ f_cancel(Seq s, string reason) =>
             f_fade(s)
             if debugMode
                 [lb, lp] = f_lastTap(s)
-                s.lDbg := label.new(lb, lp, reason, xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
+                s.lDbg := label.new(f_xc(lb), lp, reason, xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
             hist.push(s)
         else
             s.delAll()
@@ -523,7 +527,7 @@ f_hide(Seq s, string reason) =>
         f_fade(v)
         if debugMode
             [lb, lp] = f_lastTap(v)
-            v.lDbg := label.new(lb, lp, reason + " (shadow)", xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
+            v.lDbg := label.new(f_xc(lb), lp, reason + " (shadow)", xloc = xloc.bar_index, color = color.new(color.gray, 100), style = label.style_label_left, textcolor = color.gray, size = size.tiny)
         hist.push(v)
     else
         v.delAll()
@@ -723,7 +727,7 @@ f_fill(Seq s) =>
         s.lDot := label.new(bar_index, s.entryP, "", xloc = xloc.bar_index, color = c, style = label.style_circle, size = size.tiny)
         box.set_right(s.zone, bar_index)
         line.set_x2(s.midLn, bar_index)
-        line.set_x2(s.h4, math.min(s.b4 + BRACKET, bar_index))
+        line.set_x2(s.h4, f_xc(math.min(s.b4 + BRACKET, bar_index)))
         f_drawTrade(s, bar_index + BRACKET)
         f_inc("filled")
         acc.set(1, acc.get(1) + (bar_index - s.armedBar))
@@ -833,10 +837,10 @@ f_spawn(int d, int b1, float p1, int b2, float p2) =>
             s.l2    := f_label(b2, "2", d, false)
             s.h1    := f_hline(b1, p1, d)
             s.h2    := f_hline(b2, p2, d)
-            s.zone  := box.new(b1, top, bar_index, bot, xloc = xloc.bar_index, border_color = color.new(c, ZONE_TR), border_width = 1, bgcolor = color.new(c, ZONE_TR))
-            s.midLn := line.new(b1, s.mid, bar_index, s.mid, xloc = xloc.bar_index, color = color.new(c, MID_TR), style = line.style_dashed, width = 1)
+            s.zone  := box.new(f_xc(b1), top, bar_index, bot, xloc = xloc.bar_index, border_color = color.new(c, ZONE_TR), border_width = 1, bgcolor = color.new(c, ZONE_TR))
+            s.midLn := line.new(f_xc(b1), s.mid, bar_index, s.mid, xloc = xloc.bar_index, color = color.new(c, MID_TR), style = line.style_dashed, width = 1)
             if s.state == 1
-                line.set_x2(s.h1, math.min(b1 + BRACKET, s.brk3))
+                line.set_x2(s.h1, f_xc(math.min(b1 + BRACKET, s.brk3)))
                 s.l3 := f_label(s.b3, "3", d, true)
                 s.h3 := f_hline(s.b3, s.p3, d)
                 s.v3 := line.new(s.brk3, p1, s.brk3, s.p3, xloc = xloc.bar_index, color = c, width = 1)
@@ -947,7 +951,7 @@ if barstate.isconfirmed
                         s.b3    := bar_index
                         s.p3    := f_trendExt(d)
                         if not s.hidden
-                            line.set_x2(s.h1, math.min(s.b1 + BRACKET, bar_index))
+                            line.set_x2(s.h1, f_xc(math.min(s.b1 + BRACKET, bar_index)))
                             s.l3 := f_label(s.b3, "3", d, true)
                             s.h3 := f_hline(s.b3, s.p3, d)
                             s.v3 := line.new(bar_index, s.p1, bar_index, s.p3, xloc = xloc.bar_index, color = c, width = 1)
@@ -986,7 +990,7 @@ if barstate.isconfirmed
                         s.b5    := bar_index
                         s.p5    := f_trendExt(d)
                         if not s.hidden
-                            line.set_x2(s.h3, math.min(s.b3 + BRACKET, bar_index))
+                            line.set_x2(s.h3, f_xc(math.min(s.b3 + BRACKET, bar_index)))
                             s.l5 := f_label(s.b5, "5", d, true)
                             s.h5 := f_hline(s.b5, s.p5, d)
                             s.v5 := line.new(bar_index, s.p3, bar_index, s.p5, xloc = xloc.bar_index, color = c, width = 1)
