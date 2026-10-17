@@ -3,7 +3,7 @@
 | File | What it is |
 |---|---|
 | `6-tap.pine` | Indicator (v2.9): live charting, alerts, shadow research, trade log |
-| `6-tap-strategy.pine` | Strategy (v3.3): same engine with real orders, for Deep Backtesting. **Generated** — do not edit |
+| `6-tap-strategy.pine` | Strategy (v3.4): same engine with real orders, for Deep Backtesting. **Generated** — do not edit |
 | `strategy/head.pine`, `strategy/tail.pine` | Strategy-only parts (header + inputs, orders + R table) |
 | `build_strategy.py` | Builds the strategy from the indicator's shared inputs and engine blocks |
 
@@ -144,6 +144,16 @@ MNQ contract's notional is far above the initial capital, so every order was rej
 trades). With **Log skipped orders** on, each armed setup that places no order is written to
 Pine Logs with the rule that blocked it (`window`, `minRR`, `daily`, `cap`, `opposite`,
 `session`). `requireFVG` (off) only fills trades whose FVG was touched.
+**Feature tags (v3.4).** With `featureTags` on (default), every entry's order comment is
+`6T<id>|d=…|t15=…|t60=…|t240=…|tD=…|s60=…|sD=…|adx=…|chop=…|atrp=…|dtr=…|pdh=…|pdl=…|vwap=…|stopA=…|zoneA=…|ext5=…|fvg=…|bars4=…|brkA=…|ls=…|hr=…|dow=…`,
+shown in the List of Trades export's Signal column (Deep Backtesting too). Values come from the
+bar the order is (re)placed on — the confirmation bar for Confirmation · Close, the last bar
+before the fill for resting orders — using closed-bar data; higher timeframes use the last
+closed HTF bar. Trend keys (`t*`, `s*`, `vwap`) are multiplied by the direction (+ = with the
+trade). `pdh` / `pdl` are (level − entry) ÷ ATR. `dtr` = today's range so far (day from
+18:00 ET) ÷ the prior 20-day average range. `fvg` 0 none / 1 present / 2 touched / 3 mitigated.
+`ls` = consecutive closed losses before the trade. Over 255 characters (assumed limit), `dow`
+and then `hr` are dropped.
 The R table reports trades, win rate, avg win/loss,
 expectancy, expectancy ex top 5, median R, profit factor, max drawdown, max loss streak,
 best month's share of net profit, missed fills, and the pass bar
