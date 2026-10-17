@@ -1,5 +1,5 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// 6-Tap v2.2 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
+// 6-Tap v2.3 — detects and marks the 6-tap sequence (reverse-engineered from the AMN model).
 // Bearish model shown in comments; bullish is the exact mirror.
 //   Tap 1  external swing low (liquidity)      Tap 2  external swing high (protected)
 //   Zone   tap 1 .. tap 2, mid = 50%           Tap 3  big BOS / sweep of tap 1
@@ -50,6 +50,8 @@ color  bearColor       = input.color(#E5534B, "Bearish color", group = G_DSP)
 string labelSize       = input.string("small", "Label size", options = ["tiny", "small", "normal", "large"], group = G_DSP)
 
 bool   debugMode       = input.bool(false, "Debug mode (kill reasons + stats table)", group = G_DBG)
+float  commissionPerSide = input.float(0.62, "Commission per side ($ per contract)", minval = 0, step = 0.01, group = G_DBG)
+int    contracts       = input.int(1, "Contracts", minval = 1, group = G_DBG)
 
 const int BRACKET = 8    // bars a tap bracket extends to the right
 const int ZONE_TR = 88   // zone fill transparency
@@ -85,6 +87,7 @@ type Seq
     int    spawnBar         // bar the sequence was created
     string result = ""      // "", "target", "stop" or a cancel reason
     bool   faded = false
+    float  mfe = 0.0        // max favorable excursion after the fill, in price
     label  l1
     label  l2
     label  l3
@@ -144,7 +147,8 @@ var array<Seq> trades = array.new<Seq>()   // state 5
 var array<Seq> hist   = array.new<Seq>()   // finished or cancelled, faded
 
 var map<string, int> cnt = map.new<string, int>()   // debug counters
-var array<float> acc   = array.new_float(2, 0.0)   // [sum of R, sum of bars arm -> fill]
+var array<float> acc   = array.new_float(2, 0.0)   // [unused, sum of bars arm -> fill]
+var map<string, float> fs = map.new<string, float>()   // trade magnitude stats (R, points, $)
 var array<bool>  dirty = array.from(false)          // labels changed -> redo stacking
 
 // Per-bar alert flags: 0 armed short, 1 armed long, 2 filled short, 3 filled long, 4 cancelled, 5 target, 6 stop
@@ -370,12 +374,35 @@ f_cancel(Seq s, string reason) =>
     s
 
 // Trade result after a fill.
+f_addf(string k, float v) =>
+    fs.put(k, nz(fs.get(k)) + v)
+    k
+
 f_finish(Seq s, string res) =>
+    bool  win  = res == "target"
     float risk = math.abs(s.entryP - s.stopP)
+    float pts  = s.dir * ((win ? s.tgtP : s.stopP) - s.entryP)   // per contract
+    float r    = risk > 0 ? pts / risk : 0.0
     s.state  := 6
     s.result := res
     f_inc(res)
-    acc.set(0, acc.get(0) + (res == "target" ? (risk > 0 ? math.abs(s.tgtP - s.entryP) / risk : 0.0) : -1.0))
+    // Magnitude stats: totals and per direction (".L" / ".S").
+    for sfx in array.from("", s.dir == 1 ? ".L" : ".S")
+        f_addf("n" + sfx, 1)
+        f_addf((win ? "nW" : "nL") + sfx, 1)
+        f_addf((win ? "winR" : "lossR") + sfx, math.abs(r))
+    f_addf("pts", pts * contracts)
+    f_addf("usd", (pts * syminfo.pointvalue - 2 * commissionPerSide) * contracts)
+    float cum = nz(fs.get("cum")) + r
+    fs.put("cum", cum)
+    fs.put("peak", math.max(nz(fs.get("peak")), cum))
+    fs.put("dd", math.max(nz(fs.get("dd")), fs.get("peak") - cum))
+    fs.put("streak", win ? 0.0 : nz(fs.get("streak")) + 1)
+    fs.put("maxStreak", math.max(nz(fs.get("maxStreak")), fs.get("streak")))
+    if win
+        fs.put("bigWin", math.max(nz(fs.get("bigWin")), r))
+    else
+        f_addf("mfeStop", risk > 0 ? s.mfe / risk : 0.0)
     f_alert(res, s, "")
     fl.set(res == "target" ? 5 : 6, true)
     f_delTrade(s)
@@ -626,6 +653,7 @@ if barstate.isconfirmed
     // Trade outcome after a fill. Both on one bar -> stop.
     for s in trades
         if s.state == 5 and bar_index > s.b6
+            s.mfe := math.max(s.mfe, s.dir == -1 ? s.entryP - low : high - s.entryP)
             bool hitStop = s.dir == -1 ? high >= s.stopP : low <= s.stopP
             bool hitTgt  = s.dir == -1 ? low <= s.tgtP : high >= s.tgtP
             if hitStop
@@ -692,31 +720,71 @@ if barstate.isconfirmed
 
 // ───────────────────────── Debug stats ─────────────────────────
 var table dbg = na
-f_row(table t, int r, string k, string v) =>
-    table.cell(t, 0, r, k, text_color = color.gray, text_size = size.small, text_halign = text.align_left)
-    table.cell(t, 1, r, v, text_color = color.gray, text_size = size.small, text_halign = text.align_right)
-    t
+
+f_pct(float x) => na(x) ? "–" : str.tostring(100 * x, "0.0") + "%"
+f_r(float x)   => na(x) ? "–" : (x > 0 ? "+" : "") + str.tostring(x, "0.00") + "R"
+f_ratio(float x) => na(x) ? "–" : str.tostring(x, "0.00")
+
+// Trades · win rate · expectancy for one direction suffix ("", ".L", ".S").
+f_side(string sfx) =>
+    float n  = nz(fs.get("n" + sfx))
+    float nW = nz(fs.get("nW" + sfx))
+    float ex = n > 0 ? (nz(fs.get("winR" + sfx)) - nz(fs.get("lossR" + sfx))) / n : na
+    str.tostring(n, "0") + " · " + f_pct(n > 0 ? nW / n : na) + " · " + f_r(ex)
+
+f_kv(array<string> K, array<string> V, string k, string v) =>
+    K.push(k)
+    V.push(v)
+    k
 
 if debugMode and barstate.islast
     if na(dbg)
-        dbg := table.new(position.top_right, 2, 20, bgcolor = color.new(color.gray, 90), frame_width = 0, border_width = 0)
-    int nFill = nz(cnt.get("filled"))
-    int nTgt  = nz(cnt.get("target"))
-    int nStop = nz(cnt.get("stop"))
-    int nRes  = nTgt + nStop
-    f_row(dbg, 0, "Spawned", str.tostring(nz(cnt.get("spawned"))))
-    f_row(dbg, 1, "Armed", str.tostring(nz(cnt.get("armed"))))
-    f_row(dbg, 2, "Filled", str.tostring(nFill))
-    f_row(dbg, 3, "  Open", str.tostring(nFill - nRes))
-    f_row(dbg, 4, "Cancelled", str.tostring(nz(cnt.get("cancelled"))))
-    array<string> reasons = array.from("evict", "bias", "mid", "close>2", "runaway", "superseded", "expiry")
-    for [r, rs] in reasons
-        f_row(dbg, 5 + r, "  " + rs, str.tostring(nz(cnt.get(rs))))
-    f_row(dbg, 12, "Target hits", str.tostring(nTgt))
-    f_row(dbg, 13, "Stop hits", str.tostring(nStop))
-    f_row(dbg, 14, "Win rate", nRes > 0 ? str.tostring(100.0 * nTgt / nRes, "#.0") + "%" : "–")
-    f_row(dbg, 15, "Avg R", nRes > 0 ? str.tostring(acc.get(0) / nRes, "#.00") : "–")
-    f_row(dbg, 16, "Avg bars arm→fill", nFill > 0 ? str.tostring(acc.get(1) / nFill, "#.0") : "–")
+        dbg := table.new(position.top_right, 2, 40, bgcolor = color.new(color.gray, 90), frame_width = 0, border_width = 0)
+    int   nFill = nz(cnt.get("filled"))
+    int   nTgt  = nz(cnt.get("target"))
+    int   nStop = nz(cnt.get("stop"))
+    float nW    = nz(fs.get("nW"))
+    float nL    = nz(fs.get("nL"))
+    float n     = nW + nL
+    float winR  = nz(fs.get("winR"))
+    float lossR = nz(fs.get("lossR"))
+    float wr    = n > 0 ? nW / n : na
+    float avgW  = nW > 0 ? winR / nW : na
+    float avgL  = nL > 0 ? -lossR / nL : na
+    float payoff = na(avgW) or na(avgL) or avgL == 0 ? na : avgW / math.abs(avgL)
+    float pf    = lossR > 0 ? winR / lossR : na
+    float expR  = n > 0 ? (winR - lossR) / n : na
+    float beWR  = na(payoff) ? na : 1 / (1 + payoff)
+
+    array<string> K = array.new<string>()
+    array<string> V = array.new<string>()
+    f_kv(K, V, "Spawned", str.tostring(nz(cnt.get("spawned"))))
+    f_kv(K, V, "Armed", str.tostring(nz(cnt.get("armed"))))
+    f_kv(K, V, "Filled", str.tostring(nFill))
+    f_kv(K, V, "  Open", str.tostring(nFill - nTgt - nStop))
+    f_kv(K, V, "Cancelled", str.tostring(nz(cnt.get("cancelled"))))
+    for rs in array.from("evict", "bias", "mid", "close>2", "runaway", "superseded", "expiry")
+        f_kv(K, V, "  " + rs, str.tostring(nz(cnt.get(rs))))
+    f_kv(K, V, "Target hits", str.tostring(nTgt))
+    f_kv(K, V, "Stop hits", str.tostring(nStop))
+    f_kv(K, V, "Win rate (breakeven)", f_pct(wr) + " (" + f_pct(beWR) + ")")
+    f_kv(K, V, "Avg win", f_r(avgW))
+    f_kv(K, V, "Avg loss", f_r(avgL))
+    f_kv(K, V, "Payoff ratio", f_ratio(payoff))
+    f_kv(K, V, "Profit factor", na(pf) and winR > 0 ? "∞" : f_ratio(pf))
+    f_kv(K, V, "Expectancy", f_r(expR))
+    f_kv(K, V, "Net points", str.tostring(nz(fs.get("pts")), format.mintick))
+    f_kv(K, V, "Net $ (" + str.tostring(contracts) + " ct, after comm.)", str.tostring(nz(fs.get("usd")), "#,##0.00"))
+    f_kv(K, V, "Max drawdown", f_r(-nz(fs.get("dd"))))
+    f_kv(K, V, "Max consecutive losses", str.tostring(nz(fs.get("maxStreak")), "0"))
+    f_kv(K, V, "Largest win", f_r(fs.get("bigWin")))
+    f_kv(K, V, "Avg MFE on stops", nL > 0 ? str.tostring(nz(fs.get("mfeStop")) / nL, "0.00") + "R" : "–")
+    f_kv(K, V, "Long  n · win · exp", f_side(".L"))
+    f_kv(K, V, "Short n · win · exp", f_side(".S"))
+    f_kv(K, V, "Avg bars arm→fill", nFill > 0 ? str.tostring(acc.get(1) / nFill, "0.0") : "–")
+    for [i, k] in K
+        table.cell(dbg, 0, i, k, text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+        table.cell(dbg, 1, i, V.get(i), text_color = color.gray, text_size = size.small, text_halign = text.align_right)
 
 // ───────────────────────── Alert conditions (UI dropdown) ─────────────────────────
 alertcondition(fl.get(0), "6-Tap armed (short)",  '{"event":"armed","dir":"short","symbol":"{{ticker}}","tf":"{{interval}}","price":{{close}}}')

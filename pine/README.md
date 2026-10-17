@@ -16,7 +16,7 @@ at most one armed order per direction.
 
 Cancel reasons: `close>2`, `runaway`, `superseded`, `mid`, `expiry`, `bias`, `evict`.
 `bias` only applies when "Cancel sequences when bias flips" is on (off by default); bias otherwise just filters which direction new sequences spawn in, using its own longer pivot length (15).
-Turn on **Debug mode** to see the reason next to each dead sequence and a stats table.
+Turn on **Debug mode** to see the reason next to each dead sequence and a stats table: counts, cancel reasons, and trade magnitude in R (avg win/loss, payoff ratio, profit factor, expectancy vs breakeven win rate, max drawdown, loss streak, MFE on stopped trades, long/short split) plus net points and net $ after `commissionPerSide` × 2 × `contracts`.
 
 ## Notes
 - The engine only changes state on confirmed bars, and pivots are drawn back on
