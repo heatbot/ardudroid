@@ -14,30 +14,51 @@ at most one armed order per direction.
 `0` await tap 3 → `1` await tap 4 → `2` await tap 5 → `3` tap 5 trailing →
 `4` armed (limit order) → `5` in trade → `6` done or cancelled.
 
-Cancel reasons: `close>2`, `runaway`, `superseded`, `mid`, `expiry`, `bias`, `evict`.
+Cancel reasons: `close>2`, `runaway`, `superseded`, `mid`, `expiry`, `bias`, `evict`, `minTap5Ext`, `session`.
 `bias` only applies when "Cancel sequences when bias flips" is on (off by default); bias otherwise just filters which direction new sequences spawn in, using its own longer pivot length (15).
 Turn on **Debug mode** to see the reason next to each dead sequence and a stats table: counts, cancel reasons, and trade magnitude in R (avg win/loss, payoff ratio, profit factor, expectancy vs breakeven win rate, max drawdown, loss streak, MFE on stopped trades, long/short split) plus net points and net $ after `commissionPerSide` × 2 × `contracts`.
 
-## Shadow filters (v2.4)
-The model's own invalidation, a close beyond tap 2, is always enforced. The four
-invented rules (`runaway`, `expiry`, `superseded`, `minZoneATR`) each have a mode:
+## Shadow filters
+The model's own invalidation, a close beyond tap 2, is always enforced. Each
+invented rule has a mode: **Off** (not applied), **Shadow** (never cancels; the
+sequence is tagged, removed from the chart so the chart shows the Enforce view,
+and keeps running hidden until it resolves) or **Enforce** (cancels).
 
-- **Off**: the rule is not applied.
-- **Shadow** (default): nothing is cancelled. The sequence is tagged, removed from
-  the chart (so the chart shows what Enforce would show), and keeps running hidden
-  until it fills and resolves or dies on `close>2`.
-- **Enforce**: the rule cancels the sequence.
+| Filter | Checked | Default |
+|---|---|---|
+| `runaway` (tap 5 > `maxTap5Ext` zone heights past mid) | while tap 5 trails | Off |
+| `expiry` (`expiryBars` after arming) | armed | Off |
+| `superseded` (newer same-direction order arms) | arming | Off |
+| `minZoneATR` / `maxZoneATR` (zone height vs ATR) | spawn | Shadow |
+| `minTap5Ext` (tap 5 < 2 zone heights past mid) | arming | Shadow |
+| `session` (skip fills NY 09:30–16:00 ET) | would-be fill bar | Shadow |
 
-With **Debug mode** and **Filter impact table** on, a second table (bottom right)
-shows, per filter, how many filled trades it would remove, the expectancy of
-removed vs kept trades, a verdict (`Enforce` if removed expectancy < 0 over at
-least 20 trades, `Drop` if removed beats kept, else `Need data`) for the whole
-sample and each half (a flip between halves is noise), and expectancy by
-session, tap 5 extension, zone height and bars from arm to fill.
+With superseded off, up to `maxArmedPerDir` (3) armed orders per direction get
+pending lines; extra ones still count in stats and alerts.
 
-The top-right table stays the chart (Enforce) view: shadow-hidden sequences count
-as cancelled there and their trades are left out of its magnitude stats.
-Hidden sequences never affect visible ones (cap, dedupe, superseding).
+**R:R flag.** Planned R:R at arming (`|target − entry| ÷ |entry − stop|`). Outside
+`minRR`..`maxRR` (`maxRR` 0 = no upper bound) the order is not cancelled but
+marked *optional*: faded dashed lines, entry text `Long 30472.50 (opt 1.2R)`.
+Every armed order shows its R:R (`Short 30683.50 · 2.4R`); the `armed` alert carries
+`"rr"` and `"optional"`.
+
+**Daily loss limit.** Day starts 18:00 ET; only non-optional trades count.
+Shadow compares no limit vs stopping after 2 or 3 losses. Enforce draws later
+setups that day as optional (`limit`).
+
+## Debug tables
+Turn on **Debug mode**. Positions are inputs; a table that asks for a corner
+already taken moves to the next free one. Text size defaults to tiny.
+
+- **Stats** (chart view): counts, cancel reasons, magnitude in R, median R,
+  expectancy without the top 5 wins, net $ after commissions, max concurrent open trades.
+- **Filter impact** (all trades, shadow included): per filter and the `rr` flag,
+  removed vs kept expectancy and a verdict for the whole sample and each half;
+  then n / win / expectancy / median / ex-top-5 by session, tap 5 extension, zone
+  height, bars arm→fill and planned R:R.
+- **Exit variants** (chart trades): A tap 5 (the chart), B 1.5R, C 2R, D 3R,
+  E/F tap 5 with breakeven at 1R / 1.5R MFE, G half off at 1R then breakeven and
+  tap 5. Plus the daily-limit comparison and MFE / MAE excursion shares.
 
 ## Notes
 - The engine only changes state on confirmed bars, and pivots are drawn back on
